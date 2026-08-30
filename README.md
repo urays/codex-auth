@@ -1,6 +1,8 @@
 # codex-auth
 
-A lightweight Bash tool for managing multiple Codex CLI accounts. It stores account credentials in a local pool and lets you view usage, add accounts, and switch between them interactively.
+Lightweight yet full‑featured – a Bash tool that pools credentials, displays usage, enables interactive switching, and auto‑syncs, making Codex CLI multi‑account management effortless.
+
+![codex-auth account list and interactive account picker](assets/codex-auth-preview.svg)
 
 ## Features
 

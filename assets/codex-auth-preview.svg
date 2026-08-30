@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="604" viewBox="0 0 860 604" role="img" aria-labelledby="title description">
+  <title id="title">codex-auth account list and interactive account picker</title>
+  <desc id="description">Terminal preview showing three accounts, their usage limits, reset times, and the first account selected in the account picker.</desc>
+
+  <rect width="860" height="604" rx="10" fill="#161b22"/>
+  <rect x="0.5" y="0.5" width="859" height="603" rx="9.5" fill="none" stroke="#30363d"/>
+
+  <g font-family="monospace" font-size="14" font-style="normal" fill="#e6edf3" xml:space="preserve">
+    <text x="28" y="38" fill="#8b949e">Codex auth pool: /home/grayblue/.codex/auth-poll.json</text>
+    <text x="28" y="60" fill="#8b949e">Current auth:     /home/grayblue/.codex/auth.json</text>
+
+    <text x="28" y="104">:) </text>
+    <text x="53.29" y="104" fill="#ff8700">alex_random_01@example.com</text>
+    <text x="280.90" y="104">[Pro] (chatgpt)</text>
+    <text x="28" y="126">Rate Limit: </text>
+    <text x="129.16" y="126" fill="#3fb950">false</text>
+    <text x="44.86" y="148">Weekly limit: </text>
+    <text x="162.88" y="148" fill="#3fb950">93%</text>
+    <text x="196.60" y="148">remaining   resets in: 6d 22hr (2026-09-06 05:45 UTC+8)</text>
+    <text x="44.86" y="170">GPT-5.3-Codex-Spark limit: </text>
+    <text x="272.47" y="170" fill="#3fb950">100%</text>
+    <text x="314.62" y="170">remaining   resets in: 5hr 0m (2026-08-30 12:01 UTC+8)</text>
+    <text x="44.86" y="192">Gpt-reserve limit: </text>
+    <text x="205.03" y="192" fill="#3fb950">100%</text>
+    <text x="247.18" y="192">remaining   resets in: 7d 0hr (2026-09-06 07:01 UTC+8)</text>
+    <text x="44.86" y="214" fill="#8b949e">rate limit reset credits available: 2 (2026-09-15 10:00:00 UTC+8; 2026-09-20 18:30:00 UTC+8)</text>
+
+    <text x="28" y="258">:) sample_001@example.com [Free] (chatgpt)</text>
+    <text x="28" y="280">Rate Limit: </text>
+    <text x="129.16" y="280" fill="#3fb950">false</text>
+    <text x="44.86" y="302">Monthly limit: </text>
+    <text x="171.31" y="302" fill="#3fb950">100%</text>
+    <text x="213.46" y="302">remaining   resets in: 25d 13hr (2026-09-24 20:09 UTC+8)</text>
+
+    <text x="28" y="346">:) user1@example.com [Pro] (chatgpt)</text>
+    <text x="28" y="368">Rate Limit: </text>
+    <text x="129.16" y="368" fill="#3fb950">false</text>
+    <text x="44.86" y="390">Weekly limit: </text>
+    <text x="162.88" y="390" fill="#3fb950">100%</text>
+    <text x="205.03" y="390">remaining   resets in: 7d 0hr (2026-09-06 07:00 UTC+8)</text>
+    <text x="44.86" y="412">GPT-5.3-Codex-Spark limit: </text>
+    <text x="272.47" y="412" fill="#3fb950">100%</text>
+    <text x="314.62" y="412">remaining   resets in: 5hr 0m (2026-08-30 12:00 UTC+8)</text>
+
+    <text x="28" y="478" font-weight="700">Select account to switch</text>
+    <text x="247.18" y="478" fill="#8b949e">(↑/↓ move, Enter confirm, q quit)</text>
+
+    <rect x="28" y="502" width="236.04" height="20" fill="#e6edf3"/>
+    <text x="28" y="517" fill="#161b22">&gt; alex_random_01@example.com</text>
+    <text x="44.86" y="539">sample_001@example.com</text>
+    <text x="44.86" y="561">user1@example.com</text>
+  </g>
+</svg>
