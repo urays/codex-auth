@@ -21,7 +21,9 @@ set -euo pipefail
 #     it is already signed into), then the real `codex login` runs and the
 #     resulting credential is captured back into the pool automatically. A
 #     live credential whose mode the pool cannot store is never deleted.
-#   - Sessions, history and config.toml are never touched — only auth.json.
+#   - Sessions and history are never touched. config.toml may be updated only
+#     to enforce cli_auth_credentials_store = "file"; account state changes
+#     are confined to auth.json and auth-poll.json.
 
 CURRENT_AUTH_FILE="${CURRENT_AUTH_FILE:-$HOME/.codex/auth.json}"
 POOL_FILE="${AUTH_POOL_FILE:-$HOME/.codex/auth-poll.json}"
@@ -894,9 +896,7 @@ run_merged() {
       jq '.raw_auth' <<<"$item" > "$CURRENT_AUTH_FILE"
       chmod 600 "$CURRENT_AUTH_FILE"
 
-      CURRENT_AUTH_RAW="$(cat "$CURRENT_AUTH_FILE")"
-      CURRENT_AUTH_MODE="$(get_auth_mode "$CURRENT_AUTH_RAW")"
-      CURRENT_AUTH_IDENTITY="$(get_auth_identity "$CURRENT_AUTH_RAW")"
+      CURRENT_AUTH_IDENTITY="$(get_auth_identity "$(cat "$CURRENT_AUTH_FILE")")"
 
       # One-line outcome, same shape as the unchanged case; the orange email
       # is what marks that a switch happened.
@@ -1022,17 +1022,14 @@ if [[ "$MODE" == "login" ]]; then
   exit 0
 fi
 
+printf "${DIM}> %s${RESET}\n" "$(format_abs_time "$(date +%s)")"
 ensure_file_store_config
 check_current_auth_presence
 upsert_current_auth_if_present
 
 if [[ -f "$CURRENT_AUTH_FILE" ]]; then
-  CURRENT_AUTH_RAW="$(cat "$CURRENT_AUTH_FILE")"
-  CURRENT_AUTH_MODE="$(get_auth_mode "$CURRENT_AUTH_RAW")"
-  CURRENT_AUTH_IDENTITY="$(get_auth_identity "$CURRENT_AUTH_RAW")"
+  CURRENT_AUTH_IDENTITY="$(get_auth_identity "$(cat "$CURRENT_AUTH_FILE")")"
 else
-  CURRENT_AUTH_RAW=""
-  CURRENT_AUTH_MODE=""
   CURRENT_AUTH_IDENTITY=""
 fi
 
