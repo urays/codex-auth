@@ -11,7 +11,7 @@ set -euo pipefail
 #     pool (when it exists), keyed by auth identity
 #     (chatgpt account_id / api key) — no explicit save command.
 #   - `codex-auth` (no arguments) prints the account list with live usage
-#     windows fetched from ChatGPT's usage API — usage display only.
+#     windows fetched from ChatGPT's usage API and cached subscription dates.
 #   - `codex-auth switch` shows the same list followed by an email-based
 #     account picker (↑/↓ move, Enter confirm, q quit) that writes the
 #     selected credential back to ~/.codex/auth.json.
@@ -61,6 +61,7 @@ RESET_CREDITS_URL="https://chatgpt.com/backend-api/wham/rate-limit-reset-credits
 RED='\033[31m'
 GREEN='\033[32m'
 YELLOW='\033[33m'
+CYAN='\033[36m'
 ORANGE='\033[38;5;208m'
 BOLD='\033[1m'
 DIM='\033[2m'
@@ -358,31 +359,39 @@ http_error_text() {
   esac
 }
 
-decode_id_token_email() {
-  # When the usage API cannot be queried (e.g. revoked token), fall back to
-  # the email claim inside the stored id_token JWT so the list still shows
-  # the human-readable account instead of the raw account_id.
-  local raw="$1" jwt email
+decode_id_token() {
+  # Decode display metadata once per account. Subscription claims are present
+  # in stored tokens but are not modeled by Codex v0.153.4; they are cached
+  # observations, not a live billing query. JWT exp is not a subscription date.
+  local raw="$1" jwt
   jwt="$(jq -r '.tokens.id_token // empty' <<<"$raw")"
   [[ -z "$jwt" || "$jwt" == "null" ]] && return 1
-  email="$(python3 - "$jwt" <<'PYEOF'
-import sys, json, base64
+  python3 - "$jwt" <<'PYEOF'
+import base64
+import json
+import sys
+
 jwt = sys.argv[1]
 try:
     payload = jwt.split(".")[1]
     payload += "=" * (-len(payload) % 4)
     claims = json.loads(base64.urlsafe_b64decode(payload))
-    print(claims.get("email") or "")
-except Exception:
-    pass
+    auth = claims.get("https://api.openai.com/auth")
+    if not isinstance(auth, dict):
+        auth = {}
+    metadata = {
+        "email": claims.get("email"),
+        "subscription_active_until": auth.get("chatgpt_subscription_active_until"),
+    }
+    print(json.dumps({k: v if isinstance(v, str) else None for k, v in metadata.items()}))
+except (AttributeError, IndexError, TypeError, ValueError):
+    print("{}")
 PYEOF
-)"
-  [[ -n "$email" ]] && echo "$email"
 }
 
 # ------------- usage query -------------
 fetch_usage_for_account() {
-  local raw_account="$1"
+  local raw_account="$1" token_email="$2"
   local auth_mode identity display_name is_current
   local access_token account_id email plan_type limit_reached
   local response_body http_code tmp_body
@@ -423,7 +432,7 @@ fetch_usage_for_account() {
 
   if [[ -z "$access_token" ]]; then
     local fallback_email
-    fallback_email="$(decode_id_token_email "$raw_account" || echo "$account_id")"
+    fallback_email="${token_email:-$account_id}"
     jq -n \
       --arg auth_mode "$auth_mode" \
       --arg account_id "$account_id" \
@@ -480,7 +489,7 @@ fetch_usage_for_account() {
 
   if [[ "$http_code" != "200" ]]; then
     local fallback_email
-    fallback_email="$(decode_id_token_email "$raw_account" || echo "$account_id")"
+    fallback_email="${token_email:-$account_id}"
     jq -n \
       --arg auth_mode "$auth_mode" \
       --arg account_id "$account_id" \
@@ -508,7 +517,7 @@ fetch_usage_for_account() {
 
   if [[ -z "$response_body" ]] || ! jq -e . >/dev/null 2>&1 <<<"$response_body"; then
     local fallback_email
-    fallback_email="$(decode_id_token_email "$raw_account" || echo "$account_id")"
+    fallback_email="${token_email:-$account_id}"
     jq -n \
       --arg auth_mode "$auth_mode" \
       --arg account_id "$account_id" \
@@ -589,7 +598,7 @@ fetch_usage_for_account() {
     "unknown"
   ' <<<"$response_body")"
   if [[ -z "$email" || "$email" == "unknown" ]]; then
-    email="$(decode_id_token_email "$raw_account" || echo "unknown")"
+    email="${token_email:-unknown}"
   fi
 
   plan_type="$(jq -r '
@@ -710,9 +719,14 @@ fetch_usage_for_account() {
 }
 
 build_results() {
+  local metadata token_email
   RESULTS_FILE="$(mktemp)"
   jq -c '.[]' "$POOL_FILE" | while IFS= read -r account; do
-    fetch_usage_for_account "$account" >> "$RESULTS_FILE"
+    metadata="$(decode_id_token "$account" || echo '{}')"
+    token_email="$(jq -r '.email // empty' <<<"$metadata")"
+    fetch_usage_for_account "$account" "$token_email" \
+      | jq --argjson metadata "$metadata" \
+        '. + ($metadata | del(.email))' >> "$RESULTS_FILE"
     echo >> "$RESULTS_FILE"
   done
 }
@@ -731,6 +745,7 @@ render_list_lines() {
     local email plan_type limit_reached is_current query_error auth_mode
     local credits_text spend_text reset_credits reset_credit
     local expires_at expires_fmt reset_expiries reset_details_valid
+    local subscription_until
     local w label remaining after at resfmt label_display remaining_colored any_window
 
     email="$(jq -r '.email' <<<"$item")"
@@ -748,6 +763,17 @@ render_list_lines() {
       printf ":) ${ORANGE}%s${RESET} [%s] (%s)" "$email" "$plan_type" "$auth_mode"
     else
       printf ":) %s [%s] (%s)" "$email" "$plan_type" "$auth_mode"
+    fi
+
+    if [[ "$auth_mode" == "chatgpt" ]]; then
+      subscription_until="$(jq -r '.subscription_active_until // empty' <<<"$item")"
+      printf " ${DIM}│ expires${RESET} "
+      if expires_fmt="$(format_rfc3339_time "$subscription_until")"; then
+        printf "${CYAN}%s${RESET} ${DIM}%s %s${RESET}" \
+          "${expires_fmt%% *}" "${expires_fmt:11:5}" "$UTC_PLUS_8_LABEL"
+      else
+        printf "${DIM}unknown${RESET}"
+      fi
     fi
 
     if [[ -n "$query_error" ]]; then

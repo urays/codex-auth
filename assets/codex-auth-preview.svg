@@ -1,17 +1,20 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="860" height="604" viewBox="0 0 860 604" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="648" viewBox="0 0 860 648" role="img" aria-labelledby="title description">
   <title id="title">codex-auth account list and interactive account picker</title>
-  <desc id="description">Terminal preview showing three accounts, their usage limits, reset times, and the first account selected in the account picker.</desc>
+  <desc id="description">Combined terminal preview showing the startup timestamp and credential storage configuration status, followed by three accounts, their cached subscription expiry dates in UTC+8 (or unknown when unavailable), usage limits, reset times, and the first account selected in the account picker.</desc>
 
-  <rect width="860" height="604" rx="10" fill="#161b22"/>
-  <rect x="0.5" y="0.5" width="859" height="603" rx="9.5" fill="none" stroke="#30363d"/>
+  <rect width="860" height="648" rx="10" fill="#161b22"/>
+  <rect x="0.5" y="0.5" width="859" height="647" rx="9.5" fill="none" stroke="#30363d"/>
 
-  <g font-family="monospace" font-size="14" font-style="normal" fill="#e6edf3" xml:space="preserve">
+  <g font-family="monospace" font-size="14" font-style="normal" fill="#8b949e" xml:space="preserve">
+    <text x="28" y="38">&gt; 2026-08-30 07:01 UTC+8</text>
+    <text x="28" y="60">[config] cli_auth_credentials_store = "file" <tspan fill="#3fb950">✓</tspan></text>
+  </g>
+
+  <g transform="translate(0 44)" font-family="monospace" font-size="14" font-style="normal" fill="#e6edf3" xml:space="preserve">
     <text x="28" y="38" fill="#8b949e">Codex auth pool: /home/grayblue/.codex/auth-poll.json</text>
     <text x="28" y="60" fill="#8b949e">Current auth:     /home/grayblue/.codex/auth.json</text>
 
-    <text x="28" y="104">:) </text>
-    <text x="53.29" y="104" fill="#ff8700">alex_random_01@example.com</text>
-    <text x="280.90" y="104">[Pro] (chatgpt)</text>
+    <text x="28" y="104">:) <tspan fill="#ff8700">alex_random_01@example.com</tspan> [Pro] (chatgpt) <tspan fill="#8b949e">│ expires</tspan> <tspan fill="#39c5cf">2026-09-30</tspan> <tspan fill="#8b949e">07:01 UTC+8</tspan></text>
     <text x="28" y="126">Rate Limit: </text>
     <text x="129.16" y="126" fill="#3fb950">false</text>
     <text x="44.86" y="148">Weekly limit: </text>
@@ -25,14 +28,14 @@
     <text x="247.18" y="192">remaining   resets in: 7d 0hr (2026-09-06 07:01 UTC+8)</text>
     <text x="44.86" y="214" fill="#8b949e">rate limit reset credits available: 2 (2026-09-15 10:00:00 UTC+8; 2026-09-20 18:30:00 UTC+8)</text>
 
-    <text x="28" y="258">:) sample_001@example.com [Free] (chatgpt)</text>
+    <text x="28" y="258">:) sample_001@example.com [Free] (chatgpt) <tspan fill="#8b949e">│ expires</tspan> <tspan fill="#8b949e">unknown</tspan></text>
     <text x="28" y="280">Rate Limit: </text>
     <text x="129.16" y="280" fill="#3fb950">false</text>
     <text x="44.86" y="302">Monthly limit: </text>
     <text x="171.31" y="302" fill="#3fb950">100%</text>
     <text x="213.46" y="302">remaining   resets in: 25d 13hr (2026-09-24 20:09 UTC+8)</text>
 
-    <text x="28" y="346">:) user1@example.com [Pro] (chatgpt)</text>
+    <text x="28" y="346">:) user1@example.com [Pro] (chatgpt) <tspan fill="#8b949e">│ expires</tspan> <tspan fill="#39c5cf">2026-09-15</tspan> <tspan fill="#8b949e">10:00 UTC+8</tspan></text>
     <text x="28" y="368">Rate Limit: </text>
     <text x="129.16" y="368" fill="#3fb950">false</text>
     <text x="44.86" y="390">Weekly limit: </text>
