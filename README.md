@@ -63,6 +63,8 @@ Default file locations:
 
 Override these paths with the `CURRENT_AUTH_FILE`, `AUTH_POOL_FILE`, and `CONFIG_TOML` environment variables.
 
+Proxy settings are inherited from `HTTP_PROXY` and `HTTPS_PROXY`. If either is unset, the script also accepts its lowercase equivalent (`http_proxy` or `https_proxy`) and exports the uppercase value to child commands.
+
 > [!WARNING]
 > The credential pool contains access tokens or API keys. Do not share it or commit it to version control. The script sets its permissions to `600`. Running `codex-auth login` backs up the current credentials before starting a new Codex login flow.
 

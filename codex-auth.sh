@@ -29,6 +29,15 @@ CURRENT_AUTH_FILE="${CURRENT_AUTH_FILE:-$HOME/.codex/auth.json}"
 POOL_FILE="${AUTH_POOL_FILE:-$HOME/.codex/auth-poll.json}"
 CONFIG_TOML="${CONFIG_TOML:-$HOME/.codex/config.toml}"
 
+# Forward proxy settings to curl and the Codex CLI. Keep explicitly supplied
+# uppercase values; accept the common lowercase spellings as a fallback.
+if [[ -z "${HTTP_PROXY:-}" && -n "${http_proxy:-}" ]]; then
+  export HTTP_PROXY="$http_proxy"
+fi
+if [[ -z "${HTTPS_PROXY:-}" && -n "${https_proxy:-}" ]]; then
+  export HTTPS_PROXY="$https_proxy"
+fi
+
 MODE="list"
 
 if [[ $# -ge 1 ]]; then
