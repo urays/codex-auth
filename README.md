@@ -9,6 +9,7 @@ Lightweight yet full‑featured – a Bash tool that pools credentials, displays
 - Automatically syncs the current `~/.codex/auth.json` to the credential pool
 - Displays usage and reset times for ChatGPT accounts
 - Provides an interactive account picker
+- Removes inactive accounts from the credential pool with confirmation
 - Adds newly authenticated accounts to the pool automatically
 - Leaves Codex sessions, history, and other data untouched
 
@@ -49,9 +50,13 @@ codex-auth login
 
 # Switch accounts interactively
 codex-auth switch
+
+# Remove an inactive account from the pool interactively
+codex-auth remove
 ```
 
 In the account picker, use `↑` / `↓` to move, `Enter` to confirm, and `q` to quit.
+For removal, confirm with `y`. Switch away from the active account before removing it, or the next run will add it back from `auth.json`.
 
 Default file locations:
 

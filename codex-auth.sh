@@ -15,6 +15,8 @@ set -euo pipefail
 #   - `codex-auth switch` shows the same list followed by an email-based
 #     account picker (↑/↓ move, Enter confirm, q quit) that writes the
 #     selected credential back to ~/.codex/auth.json.
+#   - `codex-auth remove` uses the picker to delete an inactive account from
+#     the pool after confirmation. The active account must be switched first.
 #   - `codex-auth login` prepares a NEW account login: the live credential is
 #     backed up into the pool first, auth.json is removed so the device-auth
 #     flow starts clean (otherwise the browser just re-authorizes the account
@@ -50,6 +52,10 @@ if [[ $# -ge 1 ]]; then
       MODE="switch"
       shift
       ;;
+    remove)
+      MODE="remove"
+      shift
+      ;;
   esac
 fi
 
@@ -59,7 +65,7 @@ if [[ $# -ge 1 ]]; then
   if [[ "$1" == *.json || "$1" == */* ]]; then
     POOL_FILE="$1"
   else
-    echo "Error: unknown command: $1 (supported: login, switch, or run without arguments)" >&2
+    echo "Error: unknown command: $1 (supported: login, switch, remove, or run without arguments)" >&2
     exit 1
   fi
 fi
@@ -92,6 +98,9 @@ cleanup() {
   # EXIT trap, which would otherwise override the script's real exit status.
   if [[ -n "${TMP_UPSERT_FILE:-}" && -f "${TMP_UPSERT_FILE:-}" ]]; then
     rm -f "$TMP_UPSERT_FILE"
+  fi
+  if [[ -n "${TMP_REMOVE_FILE:-}" && -f "${TMP_REMOVE_FILE:-}" ]]; then
+    rm -f "$TMP_REMOVE_FILE"
   fi
   if [[ -n "${RESULTS_FILE:-}" && -f "${RESULTS_FILE:-}" ]]; then
     rm -f "$RESULTS_FILE"
@@ -880,8 +889,36 @@ render_picker_lines() {
   done
 }
 
+remove_pool_account() {
+  local selected="$1" sorted_json="$2"
+  TMP_REMOVE_FILE="$(mktemp "${POOL_FILE}.tmp.XXXXXX")"
+
+  if ! jq -s --argjson selected "$selected" '
+    def auth_identity($a):
+      if ($a.auth_mode // "apikey") == "chatgpt" then
+        ($a.tokens.account_id // "")
+      elif ($a.auth_mode // "apikey") == "apikey" then
+        ($a.OPENAI_API_KEY // "")
+      else "" end;
+
+    .[0][$selected].raw_auth as $target
+    | auth_identity($target) as $id
+    | .[1] as $pool
+    | if $id == "" or ([ $pool[] | select(auth_identity(.) == $id) ] | length) == 0
+      then error("selected account is missing from the pool")
+      else $pool | map(select(auth_identity(.) != $id))
+      end
+  ' <(printf '%s\n' "$sorted_json") "$POOL_FILE" > "$TMP_REMOVE_FILE"; then
+    return 1
+  fi
+
+  mv "$TMP_REMOVE_FILE" "$POOL_FILE"
+  chmod 600 "$POOL_FILE"
+  unset TMP_REMOVE_FILE
+}
+
 run_merged() {
-  local sorted_json count selected key item target_label is_current
+  local sorted_json count selected key item target_label is_current confirm previous_selected
 
   sorted_json="$(sort_results_to_json)"
   count="$(jq 'length' <<<"$sorted_json")"
@@ -892,20 +929,23 @@ run_merged() {
     return 0
   fi
 
-  # Usage-only mode, or non-interactive stdin → show the list only.
-  if [[ "$MODE" != "switch" || ! -t 0 ]]; then
+  if [[ "$MODE" == "remove" && ! -t 0 ]]; then
+    echo "Error: remove requires an interactive terminal." >&2
+    return 1
+  fi
+
+  # Usage-only mode, or non-interactive switch → show the list only.
+  if [[ "$MODE" == "list" || ! -t 0 ]]; then
     render_list_lines "$sorted_json"
     return 0
   fi
 
   selected=0
+  render_list_lines "$sorted_json"
+  printf "\n${BOLD}Select account to %s${RESET}  ${DIM}(↑/↓ move, Enter confirm, q quit)${RESET}\n\n" "$MODE"
+  render_picker_lines "$selected" "$sorted_json"
 
   while true; do
-    printf "\033[H\033[J"
-    render_list_lines "$sorted_json"
-    printf "\n${BOLD}Select account to switch${RESET}  ${DIM}(↑/↓ move, Enter confirm, q quit)${RESET}\n\n"
-    render_picker_lines "$selected" "$sorted_json"
-
     IFS= read -rsn1 key || { printf "\n"; return 0; }
 
     if [[ "$key" == "q" || "$key" == "Q" ]]; then
@@ -918,15 +958,29 @@ run_merged() {
       is_current="$(jq -r '.is_current' <<<"$item")"
       target_label="$(jq -r '.email' <<<"$item")"
 
-      if [[ "$is_current" == "true" ]]; then
-        # Enter on the active account: nothing changes; show the outcome in
-        # the same dim style as the cancel message.
-        printf "\033[H\033[J"
-        printf "${DIM}Current account: %s${RESET}\n" "$target_label"
+      if [[ "$MODE" == "remove" ]]; then
+        if [[ "$is_current" == "true" ]]; then
+          printf "${YELLOW}Switch to another account before removing %s; auth.json would add it back on the next run.${RESET}\n" "$target_label"
+          return 1
+        fi
+        printf "Remove %s from the auth pool? [y/N] " "$target_label"
+        IFS= read -rsn1 confirm || return 1
+        printf "\n"
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+          printf "${DIM}Cancelled — no changes made.${RESET}\n"
+          return 0
+        fi
+        remove_pool_account "$selected" "$sorted_json"
+        printf "${GREEN}Removed %s from the auth pool.${RESET}\n" "$target_label"
         return 0
       fi
 
-      printf "\033[H\033[J"
+      if [[ "$is_current" == "true" ]]; then
+        # Enter on the active account: nothing changes; show the outcome in
+        # the same dim style as the cancel message.
+        printf "${DIM}Current account: %s${RESET}\n" "$target_label"
+        return 0
+      fi
 
       jq '.raw_auth' <<<"$item" > "$CURRENT_AUTH_FILE"
       chmod 600 "$CURRENT_AUTH_FILE"
@@ -941,6 +995,7 @@ run_merged() {
 
     if [[ "$key" == $'\x1b' ]]; then
       IFS= read -rsn2 key || true
+      previous_selected=$selected
       case "$key" in
         "[A")
           (( selected > 0 )) && selected=$((selected - 1))
@@ -949,6 +1004,11 @@ run_merged() {
           (( selected < count - 1 )) && selected=$((selected + 1))
           ;;
       esac
+      if (( selected != previous_selected )); then
+        # Redraw only the short picker; the usage list stays on screen.
+        printf '\033[%dA' "$count"
+        render_picker_lines "$selected" "$sorted_json"
+      fi
     fi
   done
 }
