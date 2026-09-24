@@ -9,8 +9,9 @@ Lightweight yet full‑featured – a Bash tool that pools credentials, displays
 - Automatically syncs the current `~/.codex/auth.json` to the credential pool
 - Displays usage and reset times for ChatGPT accounts
 - Provides an interactive account picker
+- Removes `installation_id` when switching to a different account
 - Adds newly authenticated accounts to the pool automatically
-- Leaves Codex sessions, history, and other data untouched
+- Leaves Codex sessions and history untouched
 
 ## Requirements
 
@@ -60,8 +61,11 @@ Default file locations:
 | Current credentials | `~/.codex/auth.json` |
 | Credential pool | `~/.codex/auth-poll.json` |
 | Codex configuration | `~/.codex/config.toml` |
+| Installation identifier | `~/.codex/installation_id` |
 
-Override these paths with the `CURRENT_AUTH_FILE`, `AUTH_POOL_FILE`, and `CONFIG_TOML` environment variables.
+Override the credential, pool, and configuration paths with the `CURRENT_AUTH_FILE`, `AUTH_POOL_FILE`, and `CONFIG_TOML` environment variables, respectively. The installation identifier path is derived from the directory containing `CURRENT_AUTH_FILE`.
+
+The script may update `config.toml` to set `cli_auth_credentials_store = "file"`, so Codex uses `auth.json` for credential storage.
 
 > [!WARNING]
 > The credential pool contains access tokens or API keys. Do not share it or commit it to version control. The script sets its permissions to `600`. Running `codex-auth login` backs up the current credentials before starting a new Codex login flow.

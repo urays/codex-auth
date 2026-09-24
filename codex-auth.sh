@@ -14,7 +14,9 @@ set -euo pipefail
 #     windows fetched from ChatGPT's usage API and cached subscription dates.
 #   - `codex-auth switch` shows the same list followed by an email-based
 #     account picker (↑/↓ move, Enter confirm, q quit) that writes the
-#     selected credential back to ~/.codex/auth.json.
+#     selected credential back to ~/.codex/auth.json. When the account changes,
+#     the installation_id beside auth.json is removed; restart Codex to have
+#     it generate a new ID. Running instances keep their in-memory ID.
 #   - `codex-auth login` prepares a NEW account login: the live credential is
 #     backed up into the pool first, auth.json is removed so the device-auth
 #     flow starts clean (otherwise the browser just re-authorizes the account
@@ -23,7 +25,7 @@ set -euo pipefail
 #     live credential whose mode the pool cannot store is never deleted.
 #   - Sessions and history are never touched. config.toml may be updated only
 #     to enforce cli_auth_credentials_store = "file"; account state changes
-#     are confined to auth.json and auth-poll.json.
+#     are confined to auth.json, auth-poll.json, and installation_id.
 
 CURRENT_AUTH_FILE="${CURRENT_AUTH_FILE:-$HOME/.codex/auth.json}"
 POOL_FILE="${AUTH_POOL_FILE:-$HOME/.codex/auth-poll.json}"
@@ -872,7 +874,7 @@ render_picker_lines() {
 }
 
 run_merged() {
-  local sorted_json count selected key item target_label is_current
+  local sorted_json count selected key item target_label is_current installation_id_file
 
   sorted_json="$(sort_results_to_json)"
   count="$(jq 'length' <<<"$sorted_json")"
@@ -924,9 +926,12 @@ run_merged() {
 
       CURRENT_AUTH_IDENTITY="$(get_auth_identity "$(cat "$CURRENT_AUTH_FILE")")"
 
-      # One-line outcome, same shape as the unchanged case; the orange email
-      # is what marks that a switch happened.
       printf "Current account: ${ORANGE}%s${RESET}\n" "$target_label"
+      installation_id_file="$(dirname -- "$CURRENT_AUTH_FILE")/installation_id"
+      if ! rm -f -- "$installation_id_file" 2>/dev/null; then
+        printf '%bAccount switched, but could not remove installation ID: %s%b\n' \
+          "$YELLOW" "$installation_id_file" "$RESET" >&2
+      fi
       return 0
     fi
 
