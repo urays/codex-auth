@@ -876,6 +876,7 @@ render_picker_lines() {
 
 run_merged() {
   local sorted_json count selected key item target_label is_current installation_id_file
+  local previous
 
   sorted_json="$(sort_results_to_json)"
   count="$(jq 'length' <<<"$sorted_json")"
@@ -893,12 +894,15 @@ run_merged() {
   fi
 
   selected=0
+  printf "\033[H\033[J"
+  render_list_lines "$sorted_json"
+  printf "\n${BOLD}Select account to switch${RESET}  ${DIM}(↑/↓ move, Enter confirm, q quit)${RESET}\n\n"
+  # Buffer the picker and keep each option on one physical row so moving
+  # back by $count rows also works when an email exceeds the terminal width.
+  printf '\033[?7l%s\n\033[?7h' "$(render_picker_lines "$selected" "$sorted_json")"
 
   while true; do
-    printf "\033[H\033[J"
-    render_list_lines "$sorted_json"
-    printf "\n${BOLD}Select account to switch${RESET}  ${DIM}(↑/↓ move, Enter confirm, q quit)${RESET}\n\n"
-    render_picker_lines "$selected" "$sorted_json"
+    previous="$selected"
 
     IFS= read -rsn1 key || { printf "\n"; return 0; }
 
@@ -946,6 +950,12 @@ run_merged() {
           (( selected < count - 1 )) && selected=$((selected + 1))
           ;;
       esac
+    fi
+
+    if [[ "$selected" -ne "$previous" ]]; then
+      # Return to the picker, leaving the usage list above it untouched.
+      printf '\033[%dA\r\033[J\033[?7l%s\n\033[?7h' \
+        "$count" "$(render_picker_lines "$selected" "$sorted_json")"
     fi
   done
 }
