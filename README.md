@@ -65,7 +65,16 @@ Default file locations:
 
 Override the credential, pool, and configuration paths with the `CURRENT_AUTH_FILE`, `AUTH_POOL_FILE`, and `CONFIG_TOML` environment variables, respectively. The installation identifier path is derived from the directory containing `CURRENT_AUTH_FILE`.
 
-The script may update `config.toml` to set `cli_auth_credentials_store = "file"`, so Codex uses `auth.json` for credential storage.
+The script may update `config.toml` to set `cli_auth_credentials_store = "file"`, so Codex uses `auth.json` for credential storage. All three modes (list, switch, and login) also ensure `daemon_auto_start = false` under `[features]`, adding the table or setting if missing, so the shared daemon does not interfere with using different accounts in separate sessions.
+
+> [!NOTE]
+> Setting `daemon_auto_start = false` does not stop a running daemon. Reboot to stop it, or finish any sessions using it and run:
+>
+> ```bash
+> codex app-server daemon stop
+> ```
+>
+> Subsequent CLI launches should leave it stopped unless [configuration overrides](https://learn.chatgpt.com/docs/config-file/config-basic#configuration-precedence) re-enable auto-start. Disable any separately configured startup service too.
 
 > [!WARNING]
 > The credential pool contains access tokens or API keys. Do not share it or commit it to version control. The script sets its permissions to `600`. Running `codex-auth login` backs up the current credentials before starting a new Codex login flow.

@@ -1,16 +1,17 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="860" height="648" viewBox="0 0 860 648" role="img" aria-labelledby="title description">
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="670" viewBox="0 0 860 670" role="img" aria-labelledby="title description">
   <title id="title">codex-auth account list and interactive account picker</title>
-  <desc id="description">Combined terminal preview showing the startup timestamp and credential storage configuration status, followed by three accounts, their cached subscription expiry dates in UTC+8 (or unknown when unavailable), usage limits, reset times, and the first account selected in the account picker.</desc>
+  <desc id="description">Combined terminal preview showing the startup timestamp, file-based credential storage, and disabled daemon auto-start, followed by three accounts, their cached subscription expiry dates in UTC+8 (or unknown when unavailable), usage limits, reset times, and the first account selected in the account picker.</desc>
 
-  <rect width="860" height="648" rx="10" fill="#161b22"/>
-  <rect x="0.5" y="0.5" width="859" height="647" rx="9.5" fill="none" stroke="#30363d"/>
+  <rect width="860" height="670" rx="10" fill="#161b22"/>
+  <rect x="0.5" y="0.5" width="859" height="669" rx="9.5" fill="none" stroke="#30363d"/>
 
   <g font-family="monospace" font-size="14" font-style="normal" fill="#8b949e" xml:space="preserve">
     <text x="28" y="38">&gt; 2026-08-30 07:01 UTC+8</text>
     <text x="28" y="60">[config] cli_auth_credentials_store = "file" <tspan fill="#3fb950">✓</tspan></text>
+    <text x="28" y="82">[config] features.daemon_auto_start = false <tspan fill="#3fb950">✓</tspan></text>
   </g>
 
-  <g transform="translate(0 44)" font-family="monospace" font-size="14" font-style="normal" fill="#e6edf3" xml:space="preserve">
+  <g transform="translate(0 66)" font-family="monospace" font-size="14" font-style="normal" fill="#e6edf3" xml:space="preserve">
     <text x="28" y="38" fill="#8b949e">Codex auth pool: /home/grayblue/.codex/auth-poll.json</text>
     <text x="28" y="60" fill="#8b949e">Current auth:     /home/grayblue/.codex/auth.json</text>
 

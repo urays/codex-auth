@@ -23,9 +23,10 @@ set -euo pipefail
 #     it is already signed into), then the real `codex login` runs and the
 #     resulting credential is captured back into the pool automatically. A
 #     live credential whose mode the pool cannot store is never deleted.
-#   - Sessions and history are never touched. config.toml may be updated only
-#     to enforce cli_auth_credentials_store = "file"; account state changes
-#     are confined to auth.json, auth-poll.json, and installation_id.
+#   - Sessions and history are never touched. config.toml may be updated to
+#     enforce cli_auth_credentials_store = "file" and disable
+#     features.daemon_auto_start; account state changes are confined to
+#     auth.json, auth-poll.json, and installation_id.
 
 CURRENT_AUTH_FILE="${CURRENT_AUTH_FILE:-$HOME/.codex/auth.json}"
 POOL_FILE="${AUTH_POOL_FILE:-$HOME/.codex/auth-poll.json}"
@@ -992,6 +993,64 @@ ensure_file_store_config() {
   printf "${YELLOW}[config] added cli_auth_credentials_store = \"file\"${RESET}\n"
 }
 
+ensure_daemon_auto_start_disabled() {
+  # Keep sessions on separate accounts by disabling the shared daemon.
+  local cfg="$CONFIG_TOML" input tmpfile
+
+  input="$cfg"
+  if [[ ! -f "$cfg" ]]; then
+    mkdir -p -- "$(dirname -- "$cfg")"
+    input=/dev/null
+  fi
+  tmpfile="$(mktemp "${cfg}.XXXXXX")"
+
+  # Insert the flag before trailing blank lines in [features], or add the
+  # table if missing. Buffer blank lines so section spacing stays below it.
+  # Only match keys in that table; other tables may contain the same name.
+  if ! awk '
+    /^[[:space:]]*\[/ {
+      if (in_features && !found_key) {
+        print "daemon_auto_start = false"
+        found_key = 1
+      }
+      in_features = ($0 ~ /^[[:space:]]*\[[[:space:]]*("features"|\047features\047|features)[[:space:]]*\][[:space:]]*(#.*)?$/)
+      if (in_features) found_table = 1
+    }
+    in_features && /^[[:space:]]*$/ {
+      blank_lines = blank_lines $0 ORS
+      next
+    }
+    in_features && /^[[:space:]]*("daemon_auto_start"|\047daemon_auto_start\047|daemon_auto_start)[[:space:]]*=/ {
+      sub(/=[[:space:]]*true/, "= false")
+      found_key = 1
+    }
+    {
+      printf "%s", blank_lines
+      blank_lines = ""
+      print
+    }
+    END {
+      if (!found_table) {
+        if (NR > 0) print ""
+        print "[features]"
+      }
+      if (!found_key) print "daemon_auto_start = false"
+      printf "%s", blank_lines
+    }
+  ' "$input" > "$tmpfile"; then
+    rm -f -- "$tmpfile"
+    return 1
+  fi
+
+  if [[ -f "$cfg" ]] && cmp -s -- "$cfg" "$tmpfile"; then
+    rm -f -- "$tmpfile"
+  elif ! mv -- "$tmpfile" "$cfg"; then
+    rm -f -- "$tmpfile"
+    return 1
+  fi
+  printf '%b[config] features.daemon_auto_start = false %b✓%b\n' "$DIM" "$GREEN" "$RESET"
+}
+
 check_current_auth_presence() {
   # An ACTIVE login already stored in auth.json needs no re-login. Only when
   # the credential file is missing (e.g. it lived in an OS keyring before the
@@ -1013,6 +1072,7 @@ cmd_login() {
   fi
 
   ensure_file_store_config
+  ensure_daemon_auto_start_disabled
   check_current_auth_presence
   upsert_current_auth_if_present
 
@@ -1055,6 +1115,7 @@ fi
 
 printf "${DIM}> %s${RESET}\n" "$(format_abs_time "$(date +%s)")"
 ensure_file_store_config
+ensure_daemon_auto_start_disabled
 check_current_auth_presence
 upsert_current_auth_if_present
 
