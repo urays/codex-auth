@@ -460,6 +460,9 @@ fetch_usage_for_account() {
     return
   fi
 
+  # Match Codex's account-scoped backend requests. A user token can access
+  # multiple workspaces; without this header /wham/usage may return the
+  # default workspace's quota instead of this pool entry's quota.
   tmp_body="$(mktemp)"
   http_code="$(
     curl -sS \
@@ -469,6 +472,7 @@ fetch_usage_for_account() {
       -H 'accept: */*' \
       -H 'accept-language: en-GB,en;q=0.9,zh-CN;q=0.8,zh;q=0.7,en-US;q=0.6,ja;q=0.5' \
       -H "authorization: Bearer $access_token" \
+      -H "ChatGPT-Account-Id: $account_id" \
       -H 'priority: u=1, i' \
       -H 'referer: https://chatgpt.com/codex/settings/usage' \
       -H 'sec-ch-ua: "Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"' \
@@ -562,6 +566,7 @@ fetch_usage_for_account() {
         "$RESET_CREDITS_URL" \
         -H 'accept: */*' \
         -H "authorization: Bearer $access_token" \
+        -H "ChatGPT-Account-Id: $account_id" \
         -H 'referer: https://chatgpt.com/codex/settings/usage' \
         -H 'x-openai-target-path: /backend-api/wham/rate-limit-reset-credits' \
         2>/dev/null \
