@@ -15,7 +15,9 @@ Lightweight yet full‑featured – a Bash tool that pools credentials, displays
 
 ## Requirements
 
-- Bash
+Supports Linux and macOS with their standard GNU/BSD command-line utilities.
+
+- Bash 3.2 or later (the built-in macOS Bash is supported)
 - `jq`
 - `curl`
 - [Codex CLI](https://github.com/openai/codex) (required when adding an account)

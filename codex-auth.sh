@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # codex-auth.sh — manage multiple Codex CLI accounts from a single auth pool.
+# Compatible with Bash 3.2+ on macOS and Linux (BSD/GNU utilities).
 #
 # Primary reference: show-codex-usage/show_codex_usage.sh
 #
@@ -753,7 +754,7 @@ render_list_lines() {
     local credits_text spend_text reset_credits reset_credit
     local expires_at expires_fmt reset_expiries reset_details_valid
     local subscription_until
-    local w label remaining after at resfmt label_display remaining_colored any_window
+    local w remaining after at resfmt label_display remaining_colored any_window
 
     email="$(jq -r '.email' <<<"$item")"
     plan_type="$(jq -r '.plan_type' <<<"$item")"
@@ -808,11 +809,11 @@ render_list_lines() {
     while IFS= read -r w; do
       [[ -z "$w" ]] && continue
       any_window=1
-      label="$(jq -r '.label' <<<"$w")"
+      # Capitalize via jq so macOS's Bash 3.2 works too (weekly -> Weekly).
+      label_display="$(jq -r '.label | (.[0:1] | ascii_upcase) + .[1:]' <<<"$w")"
       remaining="$(jq -r '.remaining' <<<"$w")"
       after="$(jq -r '.reset_after_seconds' <<<"$w")"
       at="$(jq -r '.reset_at' <<<"$w")"
-      label_display="${label^}"   # capitalize first char: "weekly" -> "Weekly"
       remaining_colored="$(colorize_remaining "$remaining")"
       resfmt="$(format_reset_after "$after" "$at")"
       printf "  %s limit: %b remaining   resets in: %s\n" "$label_display" "$remaining_colored" "$resfmt"
