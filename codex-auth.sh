@@ -8,7 +8,7 @@ set -euo pipefail
 #
 # Design:
 #   - ALL credentials live in ONE pool file: ~/.codex/auth-poll.json (JSON array)
-#   - Every run FIRST auto-upserts the current ~/.codex/auth.json into the
+#   - Except for `clean`, every run FIRST auto-upserts ~/.codex/auth.json into the
 #     pool (when it exists), keyed by auth identity
 #     (chatgpt account_id / api key) — no explicit save command.
 #   - `codex-auth` (no arguments) prints the account list with live usage
@@ -24,6 +24,8 @@ set -euo pipefail
 #     it is already signed into), then the real `codex login` runs and the
 #     resulting credential is captured back into the pool automatically. A
 #     live credential whose mode the pool cannot store is never deleted.
+#   - `codex-auth clean` removes a saved account using an offline picker.
+#     The current account is protected; switch accounts before removing it.
 #   - Session/history files stay in the same CODEX_HOME. Finish active work
 #     before changing accounts: restarting the daemon can interrupt calls.
 #     config.toml may be updated to enforce cli_auth_credentials_store = "file".
@@ -45,6 +47,10 @@ if [[ $# -ge 1 ]]; then
       MODE="switch"
       shift
       ;;
+    clean)
+      MODE="clean"
+      shift
+      ;;
   esac
 fi
 
@@ -55,7 +61,7 @@ if [[ $# -ge 1 ]]; then
     POOL_FILE="$1"
     shift
   else
-    echo "Error: unknown command: $1 (supported: login, switch, or run without arguments)" >&2
+    echo "Error: unknown command: $1 (supported: login, switch, clean, or run without arguments)" >&2
     exit 1
   fi
 fi
@@ -83,7 +89,7 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v curl >/dev/null 2>&1; then
+if [[ "$MODE" != "clean" ]] && ! command -v curl >/dev/null 2>&1; then
   echo "Error: curl is required but not installed." >&2
   exit 1
 fi
@@ -102,6 +108,9 @@ cleanup() {
   fi
   if [[ -n "${TMP_DAEMON_ERROR:-}" && -f "$TMP_DAEMON_ERROR" ]]; then
     rm -f "$TMP_DAEMON_ERROR"
+  fi
+  if [[ -n "${TMP_CLEAN_FILE:-}" && -f "$TMP_CLEAN_FILE" ]]; then
+    rm -f "$TMP_CLEAN_FILE"
   fi
 }
 trap cleanup EXIT
@@ -333,6 +342,45 @@ upsert_current_auth_if_present() {
   chmod 600 "$TMP_UPSERT_FILE" || return 1
   mv -f -- "$TMP_UPSERT_FILE" "$POOL_FILE" || return 1
   unset TMP_UPSERT_FILE
+}
+
+# Clean only the saved credential selected in the picker. Read the pool again
+# so unrelated additions survive, and refuse if that credential has changed.
+remove_saved_auth() {
+  local raw="$1" current target_mode target_identity current_mode current_identity
+  TMP_CLEAN_FILE="$(mktemp "${POOL_FILE}.XXXXXX")" || return 1
+  if ! jq -s --argjson target "$raw" '
+    (if length == 1 and (.[0] | type == "array") then .[0]
+     else error("auth pool is not a JSON array") end)
+    | if index($target) == null then error("selected credential changed; run clean again")
+    else map(select(. != $target)) end
+  ' "$POOL_FILE" > "$TMP_CLEAN_FILE"; then
+    return 1
+  fi
+
+  # Recheck immediately before replacing the pool: the user may have switched
+  # accounts in another terminal while this picker was open. Fail closed if the
+  # live credential cannot be read, including a dangling auth.json symlink.
+  if [[ -e "$CURRENT_AUTH_FILE" || -L "$CURRENT_AUTH_FILE" ]]; then
+    current="$(cat "$CURRENT_AUTH_FILE")" || return 1
+    if ! jq -se 'length == 1 and (.[0] | type == "object")' >/dev/null <<<"$current"; then
+      echo "Error: cannot determine the current account from auth.json." >&2
+      return 1
+    fi
+    current_mode="$(get_auth_mode "$current")" || return 1
+    current_identity="$(get_auth_identity "$current")" || return 1
+    target_mode="$(get_auth_mode "$raw")" || return 1
+    target_identity="$(get_auth_identity "$raw")" || return 1
+    if { [[ -n "$target_identity" && "$target_mode" == "$current_mode" && "$target_identity" == "$current_identity" ]]; } \
+      || jq -e --argjson target "$raw" '. == $target' >/dev/null <<<"$current"; then
+      echo "Error: cannot clean the current account. Run 'codex-auth switch' first." >&2
+      return 1
+    fi
+  fi
+
+  chmod 600 "$TMP_CLEAN_FILE" || return 1
+  mv -f -- "$TMP_CLEAN_FILE" "$POOL_FILE" || return 1
+  unset TMP_CLEAN_FILE
 }
 
 # ------------- account changes + managed daemon -------------
@@ -1000,6 +1048,43 @@ build_results() {
   done
 }
 
+build_clean_results() {
+  local account metadata label mode current='null'
+  if [[ -e "$CURRENT_AUTH_FILE" || -L "$CURRENT_AUTH_FILE" ]]; then
+    current="$(cat "$CURRENT_AUTH_FILE")" || return 1
+    if ! jq -se 'length == 1 and (.[0] | type == "object")' >/dev/null <<<"$current"; then
+      echo "Error: cannot determine the current account from auth.json." >&2
+      return 1
+    fi
+  fi
+  RESULTS_FILE="$(mktemp)" || return 1
+  while IFS= read -r account; do
+    metadata="$(decode_id_token "$account" || echo '{}')"
+    label="$(get_auth_label "$account")" || return 1
+    mode="$(get_auth_mode "$account")" || return 1
+    jq -n --argjson raw "$account" --argjson metadata "$metadata" \
+      --argjson current "$current" --arg display_label "$label" --arg mode "$mode" "$AUTH_MODE_JQ"'
+      def same_account($a; $b):
+        ($a == $b) or (
+          ($a | auth_mode) == ($b | auth_mode) and
+          (if ($a | auth_mode) == "chatgpt" then
+             ($a.tokens.account_id // "") != "" and $a.tokens.account_id == $b.tokens.account_id
+           elif ($a | auth_mode) == "apikey" then
+             ($a.OPENAI_API_KEY // "") != "" and $a.OPENAI_API_KEY == $b.OPENAI_API_KEY
+           else false end)
+        );
+      {
+        email: (if ($metadata.email // "") != "" then
+                  $metadata.email + " [" + $display_label + "]"
+                else $display_label end),
+        auth_mode: $mode,
+        is_current: same_account($raw; $current),
+        sort_key: 0,
+        raw_auth: $raw
+      }' >> "$RESULTS_FILE" || return 1
+  done < <(jq -c '.[]' "$POOL_FILE")
+}
+
 sort_results_to_json() {
   jq -s 'sort_by((if .is_current then 0 else 1 end), .sort_key, .email)' "$RESULTS_FILE"
 }
@@ -1131,6 +1216,9 @@ render_picker_lines() {
     # Minimal picker row: just the email. Full details (and the current
     # account marker) live in the list section above.
     line="${prefix}${email}"
+    if [[ "$MODE" == "clean" && "$(jq -r '.is_current' <<<"$item")" == "true" ]]; then
+      line+=" (current; switch before cleaning)"
+    fi
 
     if [[ "$idx" -eq "$selected" ]]; then
       printf "${REVERSE}%s${RESET}\n" "$line"
@@ -1148,22 +1236,31 @@ run_merged() {
   count="$(jq 'length' <<<"$sorted_json")"
 
   if [[ "$count" -eq 0 ]]; then
+    if [[ "$MODE" == "clean" ]]; then
+      printf "No saved accounts to clean.\n"
+      return 0
+    fi
     render_list_lines "$sorted_json"
     printf "\n${YELLOW}No accounts in the pool yet — run 'codex-auth login', then this tool again.${RESET}\n"
     return 0
   fi
 
   # Usage-only mode, or non-interactive stdin → show the list only.
-  if [[ "$MODE" != "switch" || ! -t 0 ]]; then
+  if [[ "$MODE" != "switch" && "$MODE" != "clean" || ! -t 0 ]]; then
     render_list_lines "$sorted_json"
     return 0
   fi
 
   selected=0
   printf "\033[H\033[J"
-  render_list_lines "$sorted_json"
-  printf "\n${DIM}Finish active Codex/Lumen work first; switching restarts a running daemon.${RESET}\n"
-  printf "${BOLD}Select account to switch${RESET}  ${DIM}(↑/↓ move, Enter confirm, q quit)${RESET}\n\n"
+  if [[ "$MODE" == "clean" ]]; then
+    printf "${DIM}Select a saved account to remove. Switch accounts before cleaning the current account.${RESET}\n"
+    printf "${BOLD}Select account to clean${RESET}  ${DIM}(↑/↓ move, Enter remove, q quit)${RESET}\n\n"
+  else
+    render_list_lines "$sorted_json"
+    printf "\n${DIM}Finish active Codex/Lumen work first; switching restarts a running daemon.${RESET}\n"
+    printf "${BOLD}Select account to switch${RESET}  ${DIM}(↑/↓ move, Enter confirm, q quit)${RESET}\n\n"
+  fi
   # Buffer the picker and keep each option on one physical row so moving
   # back by $count rows also works when an email exceeds the terminal width.
   printf '\033[?7l%s\n\033[?7h' "$(render_picker_lines "$selected" "$sorted_json")"
@@ -1182,6 +1279,12 @@ run_merged() {
       item="$(jq -c ".[$selected]" <<<"$sorted_json")"
       is_current="$(jq -r '.is_current' <<<"$item")"
       target_label="$(jq -r '.email' <<<"$item")"
+
+      if [[ "$MODE" == "clean" ]]; then
+        remove_saved_auth "$(jq '.raw_auth' <<<"$item")" || return 1
+        printf "\nRemoved saved account: %s\n" "$target_label"
+        return 0
+      fi
 
       if [[ "$is_current" == "true" ]]; then
         # Enter on the active account: nothing changes; show the outcome in
@@ -1372,6 +1475,24 @@ cmd_login() {
 }
 
 # ------------- main -------------
+if [[ "$MODE" == "clean" ]]; then
+  if [[ ! -t 0 ]]; then
+    echo "Error: 'codex-auth clean' requires an interactive terminal." >&2
+    exit 1
+  fi
+  if [[ ! -e "$POOL_FILE" && ! -L "$POOL_FILE" ]]; then
+    printf "No saved accounts to clean.\n"
+    exit 0
+  fi
+  if ! jq -se 'length == 1 and (.[0] | type == "array" and all(.[]; type == "object"))' "$POOL_FILE" >/dev/null; then
+    echo "Error: auth pool file must be a JSON array of accounts: $POOL_FILE" >&2
+    exit 1
+  fi
+  build_clean_results
+  run_merged
+  exit 0
+fi
+
 if [[ "$MODE" == "login" ]]; then
   cmd_login "$@"
   exit 0

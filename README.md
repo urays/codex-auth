@@ -9,6 +9,7 @@ A Bash tool for managing Codex CLI accounts, checking usage, and switching accou
 - Saves accounts automatically when you log in
 - Displays usage and reset times for ChatGPT accounts
 - Switches accounts through an interactive picker
+- Cleans up saved accounts through an interactive picker
 - Retains saved sessions and history
 
 ## Requirements
@@ -50,12 +51,15 @@ codex-auth login
 
 # Switch accounts interactively
 codex-auth switch
+
+# Remove a saved account interactively
+codex-auth clean
 ```
 
 In the account picker, use `↑` / `↓` to move, `Enter` to confirm, and `q` to quit.
+To clean the current account, switch to another account first.
 
-Finish running Codex tasks before switching accounts or logging in. Account changes
-may interrupt active sessions; reconnect or resume them afterwards if needed.
+Finish running Codex tasks before switching accounts or logging in. Account changes may interrupt active sessions; reconnect or resume them afterwards if needed.
 
 Data is stored in `~/.codex` by default. Set `CODEX_HOME` to use another Codex data directory.
 
