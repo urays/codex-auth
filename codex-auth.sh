@@ -16,21 +16,22 @@ set -euo pipefail
 #   - `codex-auth switch` shows the same list followed by an email-based
 #     account picker (↑/↓ move, Enter confirm, q quit) that writes the
 #     selected credential back to ~/.codex/auth.json. When the account changes,
-#     the installation_id beside auth.json is removed; restart Codex to have
-#     it generate a new ID. Running instances keep their in-memory ID.
+#     the installation_id beside auth.json is removed and a running managed
+#     daemon is restarted to load the new credentials.
 #   - `codex-auth login` prepares a NEW account login: the live credential is
 #     backed up into the pool first, auth.json is removed so the device-auth
 #     flow starts clean (otherwise the browser just re-authorizes the account
 #     it is already signed into), then the real `codex login` runs and the
 #     resulting credential is captured back into the pool automatically. A
 #     live credential whose mode the pool cannot store is never deleted.
-#   - Sessions and history are never touched. config.toml may be updated to
-#     enforce cli_auth_credentials_store = "file"; account state changes are
-#     confined to auth.json, auth-poll.json, and installation_id.
+#   - Session/history files stay in the same CODEX_HOME. Finish active work
+#     before changing accounts: restarting the daemon can interrupt calls.
+#     config.toml may be updated to enforce cli_auth_credentials_store = "file".
 
-CURRENT_AUTH_FILE="${CURRENT_AUTH_FILE:-$HOME/.codex/auth.json}"
-POOL_FILE="${AUTH_POOL_FILE:-$HOME/.codex/auth-poll.json}"
-CONFIG_TOML="${CONFIG_TOML:-$HOME/.codex/config.toml}"
+CODEX_AUTH_HOME="${CODEX_HOME:-$HOME/.codex}"
+CURRENT_AUTH_FILE="${CURRENT_AUTH_FILE:-$CODEX_AUTH_HOME/auth.json}"
+POOL_FILE="${AUTH_POOL_FILE:-$CODEX_AUTH_HOME/auth-poll.json}"
+CONFIG_TOML="${CONFIG_TOML:-$CODEX_AUTH_HOME/config.toml}"
 
 MODE="list"
 
@@ -52,10 +53,16 @@ if [[ $# -ge 1 ]]; then
   # when it looks like a path; otherwise report an unknown command.
   if [[ "$1" == *.json || "$1" == */* ]]; then
     POOL_FILE="$1"
+    shift
   else
     echo "Error: unknown command: $1 (supported: login, switch, or run without arguments)" >&2
     exit 1
   fi
+fi
+
+if [[ $# -gt 0 ]]; then
+  echo "Error: unexpected argument: $1" >&2
+  exit 1
 fi
 
 USAGE_URL="https://chatgpt.com/backend-api/wham/usage"
@@ -90,12 +97,30 @@ cleanup() {
   if [[ -n "${RESULTS_FILE:-}" && -f "${RESULTS_FILE:-}" ]]; then
     rm -f "$RESULTS_FILE"
   fi
+  if [[ -n "${TMP_AUTH_FILE:-}" && -f "$TMP_AUTH_FILE" ]]; then
+    rm -f "$TMP_AUTH_FILE"
+  fi
+  if [[ -n "${TMP_DAEMON_ERROR:-}" && -f "$TMP_DAEMON_ERROR" ]]; then
+    rm -f "$TMP_DAEMON_ERROR"
+  fi
 }
 trap cleanup EXIT
 
 # ------------- auth pool helpers -------------
+# Match AuthDotJson::resolved_mode in the current Codex CLI. auth_mode is optional.
+AUTH_MODE_JQ='
+  def auth_mode:
+    .auth_mode // (
+      if .personal_access_token != null then "personalAccessToken"
+      elif .bedrock_api_key != null then "bedrockApiKey"
+      elif .bedrock_access_keys != null then "bedrockAccessKeys"
+      elif .OPENAI_API_KEY != null then "apikey"
+      else "chatgpt" end
+    );
+'
+
 get_auth_mode() {
-  jq -r '.auth_mode // "apikey"' <<<"$1"
+  jq -r "$AUTH_MODE_JQ auth_mode" <<<"$1"
 }
 
 get_auth_identity() {
@@ -134,11 +159,14 @@ is_current_auth() {
 }
 
 validate_current_auth_file() {
-  if ! jq -e '
+  local auth_file="${1:-$CURRENT_AUTH_FILE}"
+  if ! jq -e "$AUTH_MODE_JQ"'
     type == "object"
+    and (.auth_mode == null or (.auth_mode | type == "string"))
+    and (.OPENAI_API_KEY == null or (.OPENAI_API_KEY | type == "string"))
     and (
       (
-        (.auth_mode // "chatgpt") == "chatgpt"
+        auth_mode == "chatgpt"
         and .tokens
         and .tokens.account_id
         and (.tokens.account_id | type == "string")
@@ -152,29 +180,105 @@ validate_current_auth_file() {
         and .tokens.refresh_token
         and (.tokens.refresh_token | type == "string")
         and (.tokens.refresh_token | length > 0)
+        and (.tokens.id_token | type == "string" and length > 0)
+        and (.last_refresh | type == "string" and length > 0)
       )
       or
       (
-        (.auth_mode // "chatgpt") == "apikey"
+        auth_mode == "apikey"
         and .OPENAI_API_KEY
         and (.OPENAI_API_KEY | type == "string")
         and (.OPENAI_API_KEY | length > 0)
       )
     )
-  ' "$CURRENT_AUTH_FILE" > /dev/null; then
-    echo "Error: current auth file is not a valid chatgpt/apikey auth.json: $CURRENT_AUTH_FILE" >&2
-    exit 1
+  ' "$auth_file" > /dev/null; then
+    echo "Error: invalid chatgpt/apikey auth.json: $auth_file" >&2
+    return 1
+  fi
+  # Codex deserializes the ID token's JWT claims and an RFC3339 last_refresh.
+  # Checking just account_id would accept a file Codex cannot actually use.
+  if ! python3 - "$auth_file" 3<<<"${2:-null}" <<'PY'
+import base64
+from datetime import datetime
+import json
+import os
+import sys
+
+def require(condition):
+    if not condition:
+        raise ValueError("invalid credentials")
+
+def jwt_claims(token):
+    parts = token.split(".")
+    require(len(parts) >= 3 and all(parts[:3]))
+    payload = parts[1]
+    claims = json.loads(base64.b64decode(payload + "=" * (-len(payload) % 4), altchars=b"-_", validate=True))
+    require(isinstance(claims, dict))
+    return claims
+
+def principal(claims):
+    details = claims.get("https://api.openai.com/auth") or {}
+    # A workspace selected in account_id may differ from a token's default
+    # workspace. Compare user identifiers, not that default workspace claim.
+    return {key: value for key, value in {
+        "sub": claims.get("sub"),
+        "user": details.get("chatgpt_user_id") or details.get("user_id"),
+    }.items() if isinstance(value, str) and value}
+
+try:
+    with open(sys.argv[1]) as stream:
+        auth = json.load(stream)
+    tokens = auth.get("tokens")
+    if tokens is not None:
+        for key in ("id_token", "access_token", "refresh_token"):
+            require(isinstance(tokens[key], str))
+        require(tokens.get("account_id") is None or isinstance(tokens["account_id"], str))
+        claims = jwt_claims(tokens["id_token"])
+        for section in (claims, claims.get("https://api.openai.com/profile")):
+            require(section is None or isinstance(section, dict))
+            if section is not None:
+                require(section.get("email") is None or isinstance(section["email"], str))
+        details = claims.get("https://api.openai.com/auth")
+        require(details is None or isinstance(details, dict))
+        if details is not None:
+            for key in ("chatgpt_user_id", "user_id", "chatgpt_account_id", "chatgpt_plan_type"):
+                require(details.get(key) is None or isinstance(details[key], str))
+            if "chatgpt_account_is_fedramp" in details:
+                require(isinstance(details["chatgpt_account_is_fedramp"], bool))
+    refreshed = auth.get("last_refresh")
+    if refreshed is not None:
+        require(datetime.fromisoformat(refreshed.replace("Z", "+00:00")).tzinfo is not None)
+    with os.fdopen(3) as stream:
+        expected = json.load(stream)
+    if expected is not None:
+        mode = lambda raw: raw.get("auth_mode") or ("apikey" if raw.get("OPENAI_API_KEY") is not None else "chatgpt")
+        require(mode(auth) == mode(expected))
+        if mode(expected) == "apikey":
+            require(auth["OPENAI_API_KEY"] == expected["OPENAI_API_KEY"])
+        else:
+            previous = expected["tokens"]
+            require(tokens["account_id"] == previous["account_id"])
+            for key in ("id_token", "access_token"):
+                if tokens[key] != previous[key]:
+                    before, after = principal(jwt_claims(previous[key])), principal(jwt_claims(tokens[key]))
+                    require(bool(before) and all(after.get(k) == v for k, v in before.items()))
+except (KeyError, ValueError, TypeError, AttributeError, OSError):
+    sys.exit(1)
+PY
+  then
+    echo "Error: invalid token data or refresh timestamp in auth.json: $auth_file" >&2
+    return 1
   fi
 }
 
 ensure_pool_file() {
   if [[ ! -f "$POOL_FILE" ]]; then
-    echo '[]' > "$POOL_FILE"
+    echo '[]' > "$POOL_FILE" || return 1
   fi
-  chmod 600 "$POOL_FILE"
+  chmod 600 "$POOL_FILE" || return 1
   if ! jq -e 'type == "array"' "$POOL_FILE" > /dev/null; then
     echo "Error: auth pool file is not a JSON array: $POOL_FILE" >&2
-    exit 1
+    return 1
   fi
 }
 
@@ -188,22 +292,22 @@ upsert_current_auth_if_present() {
   # agentIdentity, bedrockApiKey, ...) are warned about and skipped: they
   # never reach the pool, so login refuses to delete them.
   local live_mode
-  live_mode="$(get_auth_mode "$(cat "$CURRENT_AUTH_FILE")")"
+  live_mode="$(get_auth_mode "$(cat "$CURRENT_AUTH_FILE")")" || return 1
   if [[ "$live_mode" != "chatgpt" && "$live_mode" != "apikey" ]]; then
     printf "${YELLOW}[auth] unsupported auth_mode '%s' — skipped pool upsert${RESET}\n" "$live_mode"
     return 0
   fi
 
-  validate_current_auth_file
-  ensure_pool_file
+  validate_current_auth_file || return 1
+  ensure_pool_file || return 1
 
-  TMP_UPSERT_FILE="$(mktemp)"
+  TMP_UPSERT_FILE="$(mktemp "${POOL_FILE}.XXXXXX")" || return 1
 
-  jq --slurpfile new_auth "$CURRENT_AUTH_FILE" '
+  jq --slurpfile new_auth "$CURRENT_AUTH_FILE" "$AUTH_MODE_JQ"'
     def auth_identity($a):
-      if (($a.auth_mode // "apikey")) == "chatgpt" then
+      if ($a | auth_mode) == "chatgpt" then
         ($a.tokens.account_id // "")
-      elif (($a.auth_mode // "apikey")) == "apikey" then
+      elif ($a | auth_mode) == "apikey" then
         ($a.OPENAI_API_KEY // "")
       else
         ""
@@ -224,11 +328,168 @@ upsert_current_auth_if_present() {
       else
         . + [$new]
       end
-  ' "$POOL_FILE" > "$TMP_UPSERT_FILE"
+  ' "$POOL_FILE" > "$TMP_UPSERT_FILE" || return 1
 
-  mv "$TMP_UPSERT_FILE" "$POOL_FILE"
-  chmod 600 "$POOL_FILE"
+  chmod 600 "$TMP_UPSERT_FILE" || return 1
+  mv -f -- "$TMP_UPSERT_FILE" "$POOL_FILE" || return 1
   unset TMP_UPSERT_FILE
+}
+
+# ------------- account changes + managed daemon -------------
+codex_cli() {
+  CODEX_HOME="$CODEX_AUTH_HOME" command codex "$@"
+}
+
+prepare_account_change() {
+  local auth_dir config_dir
+  if ! command -v codex >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: account changes require the current Codex CLI and Python 3." >&2
+    return 1
+  fi
+  mkdir -p -- "$CODEX_AUTH_HOME" || return 1
+  CODEX_AUTH_HOME="$(cd -- "$CODEX_AUTH_HOME" && pwd -P)" || return 1
+  auth_dir="$(cd -- "$(dirname -- "$CURRENT_AUTH_FILE")" && pwd -P)" || return 1
+  config_dir="$(cd -- "$(dirname -- "$CONFIG_TOML")" && pwd -P)" || return 1
+  # A CLI invocation always reads these names from CODEX_HOME. Refuse overrides
+  # that would update one credential while restarting another home's daemon.
+  if [[ "$auth_dir/$(basename -- "$CURRENT_AUTH_FILE")" != "$CODEX_AUTH_HOME/auth.json" ||
+        "$config_dir/$(basename -- "$CONFIG_TOML")" != "$CODEX_AUTH_HOME/config.toml" ||
+        -L "$CURRENT_AUTH_FILE" || ( -e "$CURRENT_AUTH_FILE" && ! -f "$CURRENT_AUTH_FILE" ) ]]; then
+    echo "Error: account changes require auth.json and config.toml in CODEX_HOME; auth.json must be a regular file, not a symlink." >&2
+    return 1
+  fi
+  CURRENT_AUTH_FILE="$CODEX_AUTH_HOME/auth.json"
+  CONFIG_TOML="$CODEX_AUTH_HOME/config.toml"
+  if ! codex_cli app-server daemon restart --help >/dev/null 2>&1; then
+    echo "Error: the current Codex CLI daemon commands are required." >&2
+    return 1
+  fi
+  probe_daemon
+}
+
+probe_daemon() {
+  local output
+  TMP_DAEMON_ERROR="$(mktemp)" || return 1
+  if output="$(codex_cli app-server daemon version 2>"$TMP_DAEMON_ERROR")"; then
+    if ! jq -e --arg socket "$CODEX_AUTH_HOME/app-server-control/app-server-control.sock" '
+      .status == "running" and .backend == "pid" and .socketPath == $socket
+      and (.appServerVersion | type == "string" and length > 0)
+    ' <<<"$output" >/dev/null 2>&1; then
+      echo "Error: unexpected daemon status or an unmanaged app-server; credentials were not synchronized." >&2
+      return 1
+    fi
+    DAEMON_WAS_RUNNING=1
+  else
+    # The current CLI has no structured not-running response for `version`.
+    # Accept only its exact missing-socket error AND absent runtime records.
+    # Timeouts, permissions, stale records, startup reservations and malformed
+    # settings remain errors. Never infer 'stopped' from an arbitrary failure.
+    if ! python3 - "$CODEX_AUTH_HOME" "$TMP_DAEMON_ERROR" <<'PY'
+import fcntl
+import os
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+message = Path(sys.argv[2]).read_text()
+socket_path = root / "app-server-control/app-server-control.sock"
+if f"failed to connect to {socket_path}" not in message or "(os error 2)" not in message:
+    sys.exit(1)
+try:
+    for entry in (socket_path, root / "app-server-daemon/daemon.pid",
+                  root / "app-server-daemon/app-server.pid"):
+        try:
+            entry.lstat()
+        except FileNotFoundError:
+            continue
+        sys.exit(1)
+    # Both PID namespaces are used by the current CLI, depending on installation.
+    for name in ("daemon.pid.lock", "app-server.pid.lock", "daemon.lock"):
+        try:
+            fd = os.open(root / "app-server-daemon" / name, os.O_RDONLY)
+        except FileNotFoundError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+except OSError:
+    sys.exit(1)
+PY
+    then
+      echo "Error: cannot confirm daemon state; account change cannot complete." >&2
+      cat "$TMP_DAEMON_ERROR" >&2
+      return 1
+    fi
+    DAEMON_WAS_RUNNING=0
+  fi
+  rm -f -- "$TMP_DAEMON_ERROR"
+  unset TMP_DAEMON_ERROR
+}
+
+daemon_recovery_hint() {
+  printf 'Credentials may already be updated. After finishing active work, retry: CODEX_HOME=%q codex app-server daemon restart\n' \
+    "$CODEX_AUTH_HOME" >&2
+}
+
+finish_account_change() {
+  local expected_auth="$1" output was_running="$DAEMON_WAS_RUNNING"
+  # Login can take minutes. Recheck so a daemon started during that flow is
+  # refreshed too. A daemon that stopped meanwhile stays stopped.
+  if ! probe_daemon; then
+    daemon_recovery_hint
+    return 1
+  fi
+  if ! rm -f -- "$CODEX_AUTH_HOME/installation_id"; then
+    echo "Error: credentials updated, but installation_id could not be removed." >&2
+    daemon_recovery_hint
+    return 1
+  fi
+  if [[ "$DAEMON_WAS_RUNNING" -eq 1 ]]; then
+    printf '%b[daemon] restarting to load the new account...%b\n' "$DIM" "$RESET"
+    if ! output="$(codex_cli app-server daemon restart)"; then
+      echo "Error: credentials updated, but daemon restart failed." >&2
+      daemon_recovery_hint
+      return 1
+    fi
+    if ! jq -e --arg socket "$CODEX_AUTH_HOME/app-server-control/app-server-control.sock" '
+      .status == "restarted" and .backend == "pid" and .socketPath == $socket
+      and (.appServerVersion | type == "string" and length > 0)
+    ' <<<"$output" >/dev/null 2>&1; then
+      echo "Error: credentials updated, but daemon restart could not be verified." >&2
+      daemon_recovery_hint
+      return 1
+    fi
+  elif [[ "$was_running" -eq 1 ]]; then
+    printf '%b[daemon] no longer running; the next start will load the account.%b\n' "$DIM" "$RESET"
+  fi
+  if ! validate_current_auth_file "$CURRENT_AUTH_FILE" "$expected_auth"; then
+    echo "Error: credentials changed unexpectedly during account activation; retry after finishing other Codex activity." >&2
+    return 1
+  fi
+}
+
+activate_auth() {
+  local raw="$1"
+  prepare_account_change || return 1
+  TMP_AUTH_FILE="$(mktemp "$CODEX_AUTH_HOME/.auth.json.XXXXXX")" || return 1
+  if ! jq '.' <<<"$raw" > "$TMP_AUTH_FILE" ||
+     ! validate_current_auth_file "$TMP_AUTH_FILE" ||
+     ! chmod 600 "$TMP_AUTH_FILE"; then
+    return 1
+  fi
+  # Capture tokens refreshed while the account picker was open.
+  # Unlike listing, replacing a credential requires that the pool can back it up.
+  if [[ -f "$CURRENT_AUTH_FILE" ]]; then
+    validate_current_auth_file || return 1
+  fi
+  upsert_current_auth_if_present || return 1
+  if ! mv -f -- "$TMP_AUTH_FILE" "$CURRENT_AUTH_FILE"; then
+    echo "Error: could not replace auth.json; daemon was not restarted." >&2
+    return 1
+  fi
+  unset TMP_AUTH_FILE
+  finish_account_change "$raw"
 }
 
 # ------------- formatting helpers -------------
@@ -880,7 +1141,7 @@ render_picker_lines() {
 }
 
 run_merged() {
-  local sorted_json count selected key item target_label is_current installation_id_file
+  local sorted_json count selected key item target_label is_current
   local previous
 
   sorted_json="$(sort_results_to_json)"
@@ -901,7 +1162,8 @@ run_merged() {
   selected=0
   printf "\033[H\033[J"
   render_list_lines "$sorted_json"
-  printf "\n${BOLD}Select account to switch${RESET}  ${DIM}(↑/↓ move, Enter confirm, q quit)${RESET}\n\n"
+  printf "\n${DIM}Finish active Codex/Lumen work first; switching restarts a running daemon.${RESET}\n"
+  printf "${BOLD}Select account to switch${RESET}  ${DIM}(↑/↓ move, Enter confirm, q quit)${RESET}\n\n"
   # Buffer the picker and keep each option on one physical row so moving
   # back by $count rows also works when an email exceeds the terminal width.
   printf '\033[?7l%s\n\033[?7h' "$(render_picker_lines "$selected" "$sorted_json")"
@@ -931,17 +1193,9 @@ run_merged() {
 
       printf "\033[H\033[J"
 
-      jq '.raw_auth' <<<"$item" > "$CURRENT_AUTH_FILE"
-      chmod 600 "$CURRENT_AUTH_FILE"
-
+      activate_auth "$(jq '.raw_auth' <<<"$item")" || return 1
       CURRENT_AUTH_IDENTITY="$(get_auth_identity "$(cat "$CURRENT_AUTH_FILE")")"
-
       printf "Current account: ${ORANGE}%s${RESET}\n" "$target_label"
-      installation_id_file="$(dirname -- "$CURRENT_AUTH_FILE")/installation_id"
-      if ! rm -f -- "$installation_id_file" 2>/dev/null; then
-        printf '%bAccount switched, but could not remove installation ID: %s%b\n' \
-          "$YELLOW" "$installation_id_file" "$RESET" >&2
-      fi
       return 0
     fi
 
@@ -967,45 +1221,96 @@ run_merged() {
 
 # ------------- config.toml guard -------------
 ensure_file_store_config() {
-  # Make sure credentials are stored in ~/.codex/auth.json (file store).
-  # This is the default since rust-v0.147.0, but set it explicitly so the
-  # auth pool can always find the live credential as a file.
-  local cfg="$CONFIG_TOML" tmpfile
-
-  if [[ ! -f "$cfg" ]]; then
-    # No config.toml yet — codex creates it on demand with the file-store
-    # default, so there is nothing to patch.
-    return 0
-  fi
-
-  if grep -qE '^("cli_auth_credentials_store"|cli_auth_credentials_store)[[:space:]]*=' "$cfg"; then
-    if grep -qE '^("cli_auth_credentials_store"|cli_auth_credentials_store)[[:space:]]*=[[:space:]]*"file"' "$cfg"; then
-      printf "${DIM}[config] cli_auth_credentials_store = \"file\" ${GREEN}✓${RESET}\n"
-    else
-      # Wrong value (keyring/auto/ephemeral) — fix in place.
-      tmpfile="$(mktemp)"
-      sed -E 's/^("?cli_auth_credentials_store"?)[[:space:]]*=.*/cli_auth_credentials_store = "file"/' "$cfg" > "$tmpfile"
-      mv "$tmpfile" "$cfg"
-      printf "${YELLOW}[config] fixed cli_auth_credentials_store → \"file\"${RESET}\n"
+  # The current Codex default is file storage; an absent config needs no edit.
+  if [[ ! -f "$CONFIG_TOML" ]]; then
+    if [[ -e "$CONFIG_TOML" || -L "$CONFIG_TOML" ]]; then
+      echo "Error: config.toml is not a readable regular file." >&2
+      return 1
     fi
     return 0
   fi
+  if ! python3 - "$CONFIG_TOML" <<'PY'
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
 
-  # Key missing — insert it into the TOP-LEVEL section: before the first
-  # [table] header (or at EOF for table-free files). Appending after a table
-  # header would silently put the key inside that table in TOML.
-  if grep -qE '^[[:space:]]*\[' "$cfg"; then
-    tmpfile="$(mktemp)"
-    awk -v add1='# Credentials live in ~/.codex/auth.json (added by codex-auth.sh).' \
-        -v add2='cli_auth_credentials_store = "file"' '
-      !done && /^[[:space:]]*\[/ { print add1; print add2; print ""; done = 1 }
-      { print }
-    ' "$cfg" > "$tmpfile"
-    mv "$tmpfile" "$cfg"
-  else
-    printf '\n# Credentials live in ~/.codex/auth.json (added by codex-auth.sh).\ncli_auth_credentials_store = "file"\n' >> "$cfg"
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
+
+temporary = None
+try:
+    path = Path(sys.argv[1]).resolve(strict=True)
+    original = path.read_text()
+    if tomllib is not None:
+        tomllib.loads(original)
+    lines = original.splitlines(keepends=True)
+    key = re.compile(r'''^([ \t]*(?:cli_auth_credentials_store|"cli_auth_credentials_store"|'cli_auth_credentials_store')[ \t]*=[ \t]*)(.*?)(\r?\n)?$''')
+    quote, depth, found = None, 0, False
+    for index, line in enumerate(lines):
+        if quote is None and depth == 0:
+            if line.lstrip().startswith("["):
+                break  # Everything after a table header belongs to a table.
+            match = key.match(line)
+            if match:
+                value = re.fullmatch(r'''(["'])([^"']*)\1([ \t]*(?:#.*)?)''', match[2])
+                if value is None:
+                    raise ValueError("credential store must be a single-line quoted value")
+                if value[2] != "file":
+                    lines[index] = match[1] + '"file"' + value[3] + (match[3] or "")
+                found = True
+                break
+        # Locate real table/key boundaries without matching examples inside
+        # multiline strings, arrays or inline tables. Preserve their text.
+        pos = 0
+        while pos < len(line):
+            char = line[pos]
+            if quote is not None:
+                if quote[0] == '"' and char == "\\":
+                    pos += 2
+                    continue
+                if line.startswith(quote, pos):
+                    pos += len(quote)
+                    quote = None
+                    continue
+            elif char == "#":
+                break
+            elif char in "\"'":
+                quote = char * (3 if line.startswith(char * 3, pos) else 1)
+                pos += len(quote)
+                continue
+            elif char in "[{":
+                depth += 1
+            elif char in "]}":
+                depth -= 1
+            pos += 1
+    updated = "".join(lines)
+    if not found:
+        updated = 'cli_auth_credentials_store = "file"\n' + updated
+    if tomllib is not None:
+        tomllib.loads(updated)
+    if updated != original:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".config.toml.", delete=False) as stream:
+            temporary = stream.name
+            os.fchmod(stream.fileno(), stat.S_IMODE(path.stat().st_mode))
+            stream.write(updated)
+        os.replace(temporary, path)
+        temporary = None
+except (OSError, ValueError) as error:
+    print(f"Error: could not configure file credential storage: {error}", file=sys.stderr)
+    sys.exit(1)
+finally:
+    if temporary is not None:
+        os.unlink(temporary)
+PY
+  then
+    return 1
   fi
-  printf "${YELLOW}[config] added cli_auth_credentials_store = \"file\"${RESET}\n"
+  printf '%b[config] cli_auth_credentials_store = "file"%b\n' "$DIM" "$RESET"
 }
 
 check_current_auth_presence() {
@@ -1023,10 +1328,8 @@ cmd_login() {
   # remove auth.json so the device-auth flow starts fresh, run the real
   # `codex login`, then capture the result back into the pool. A live
   # credential whose mode the pool cannot store is never deleted.
-  if ! command -v codex >/dev/null 2>&1; then
-    echo "Error: codex CLI not found — install it first." >&2
-    exit 1
-  fi
+  local expected_auth
+  prepare_account_change || return 1
 
   ensure_file_store_config
   check_current_auth_presence
@@ -1046,21 +1349,26 @@ cmd_login() {
     rm -f "$CURRENT_AUTH_FILE"
     printf "${GREEN}[login] previous credential is safe in the pool; auth.json cleared.${RESET}\n"
   fi
+  printf "${DIM}Finish active Codex/Lumen work first; successful login restarts a running daemon.${RESET}\n"
   printf "${BOLD}Starting codex login...${RESET}\n"
   printf "${DIM}Tip: use a browser (or incognito window) where only the account you want is\n"
   printf "signed in, and complete the authorization — aborting mid-flow can revoke the\n"
   printf "current account's tokens server-side.${RESET}\n\n"
 
-  if ! codex login "$@"; then
+  if ! codex_cli login "$@"; then
     printf "\n${YELLOW}[login] login did not complete. The previous credential is still in the${RESET}\n"
-    printf "${YELLOW}pool — run codex-auth to restore it (if the server revoked its tokens,${RESET}\n"
+    printf "${YELLOW}pool — run codex-auth switch to restore it (if the server revoked its tokens,${RESET}\n"
     printf "${YELLOW}re-login instead).${RESET}\n"
-    return 0
+    return 1
   fi
 
-  upsert_current_auth_if_present
+  validate_current_auth_file || return 1
+  chmod 600 "$CURRENT_AUTH_FILE" || return 1
+  expected_auth="$(cat "$CURRENT_AUTH_FILE")" || return 1
+  upsert_current_auth_if_present || return 1
+  finish_account_change "$expected_auth" || return 1
   printf "\n${GREEN}[login] new account captured into the pool.${RESET}\n"
-  codex login status || true
+  codex_cli login status || true
 }
 
 # ------------- main -------------

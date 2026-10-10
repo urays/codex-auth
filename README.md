@@ -1,27 +1,25 @@
 # codex-auth
 
-Lightweight yet full‑featured – a Bash tool that pools credentials, displays usage, enables interactive switching, and auto‑syncs, making Codex CLI multi‑account management effortless.
+A Bash tool for managing Codex CLI accounts, checking usage, and switching accounts.
 
 ![codex-auth account list and interactive account picker](assets/codex-auth-preview.svg)
 
 ## Features
 
-- Automatically syncs the current `~/.codex/auth.json` to the credential pool
+- Saves accounts automatically when you log in
 - Displays usage and reset times for ChatGPT accounts
-- Provides an interactive account picker
-- Removes `installation_id` when switching to a different account
-- Adds newly authenticated accounts to the pool automatically
-- Leaves Codex sessions and history untouched
+- Switches accounts through an interactive picker
+- Retains saved sessions and history
 
 ## Requirements
 
-Supports Linux and macOS with their standard GNU/BSD command-line utilities.
+Supports Linux and macOS.
 
 - Bash 3.2 or later (the built-in macOS Bash is supported)
 - `jq`
 - `curl`
-- [Codex CLI](https://github.com/openai/codex) (required when adding an account)
-- Python 3 (used to parse some timestamps and account details)
+- Lastest [Codex CLI](https://github.com/openai/codex)
+- Python 3
 
 ## Installation
 
@@ -56,21 +54,13 @@ codex-auth switch
 
 In the account picker, use `↑` / `↓` to move, `Enter` to confirm, and `q` to quit.
 
-Default file locations:
+Finish running Codex tasks before switching accounts or logging in. Account changes
+may interrupt active sessions; reconnect or resume them afterwards if needed.
 
-| File | Path |
-| --- | --- |
-| Current credentials | `~/.codex/auth.json` |
-| Credential pool | `~/.codex/auth-poll.json` |
-| Codex configuration | `~/.codex/config.toml` |
-| Installation identifier | `~/.codex/installation_id` |
-
-Override the credential, pool, and configuration paths with the `CURRENT_AUTH_FILE`, `AUTH_POOL_FILE`, and `CONFIG_TOML` environment variables, respectively. The installation identifier path is derived from the directory containing `CURRENT_AUTH_FILE`.
-
-The script may update `config.toml` to set `cli_auth_credentials_store = "file"`, so Codex uses `auth.json` for credential storage. It leaves daemon auto-start settings unchanged. If a previous version set `daemon_auto_start = false` under `[features]`, remove or change that setting manually to enable auto-start again.
+Data is stored in `~/.codex` by default. Set `CODEX_HOME` to use another Codex data directory.
 
 > [!WARNING]
-> The credential pool contains access tokens or API keys. Do not share it or commit it to version control. The script sets its permissions to `600`. Running `codex-auth login` backs up the current credentials before starting a new Codex login flow.
+> The account pool contains sensitive credentials. Do not share it or commit it to version control.
 
 ## License
 
