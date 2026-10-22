@@ -429,11 +429,14 @@ probe_daemon() {
     DAEMON_WAS_RUNNING=1
   else
     # The current CLI has no structured not-running response for `version`.
-    # Accept only its exact missing-socket error AND absent runtime records.
-    # Timeouts, permissions, stale records, startup reservations and malformed
-    # settings remain errors. Never infer 'stopped' from an arbitrary failure.
+    # Accept only a missing socket with no live PID or startup reservation.
+    # Codex 0.163.0 can leave a socket symlink into /tmp and stale PID records
+    # behind. Their presence alone does not mean a daemon is still running.
+    # Timeouts, permissions and ambiguous records remain errors.
     if ! python3 - "$CODEX_AUTH_HOME" "$TMP_DAEMON_ERROR" <<'PY'
+from contextlib import ExitStack
 import fcntl
+import json
 import os
 from pathlib import Path
 import sys
@@ -444,24 +447,53 @@ socket_path = root / "app-server-control/app-server-control.sock"
 if f"failed to connect to {socket_path}" not in message or "(os error 2)" not in message:
     sys.exit(1)
 try:
-    for entry in (socket_path, root / "app-server-daemon/daemon.pid",
-                  root / "app-server-daemon/app-server.pid"):
-        try:
-            entry.lstat()
-        except FileNotFoundError:
-            continue
-        sys.exit(1)
-    # Both PID namespaces are used by the current CLI, depending on installation.
-    for name in ("daemon.pid.lock", "app-server.pid.lock", "daemon.lock"):
-        try:
-            fd = os.open(root / "app-server-daemon" / name, os.O_RDONLY)
-        except FileNotFoundError:
-            continue
-        try:
+    # Use the Codex 0.163.0 runtime layout. Hold its existing locks while
+    # examining state, including the startup lock acquired before PID creation.
+    lock_paths = [
+        root / "app-server-control/app-server-startup.lock",
+        root / "app-server-daemon/daemon.pid.lock",
+        root / "app-server-daemon/daemon.lock",
+    ]
+    with ExitStack() as locks:
+        for path in lock_paths:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                continue
+            locks.callback(os.close, fd)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        finally:
-            os.close(fd)
-except OSError:
+
+        # Follow the socket symlink: a dangling link is a stopped daemon's
+        # leftover endpoint. Permission failures must not count as absence.
+        try:
+            socket_path.stat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("control socket still exists")
+
+        # A stale JSON PID record is safe only if its process no longer exists.
+        # A live/reused PID, malformed record or unreadable file is ambiguous.
+        path = root / "app-server-daemon/daemon.pid"
+        if path.is_symlink():
+            raise ValueError(f"unexpected PID symlink: {path}")
+        try:
+            raw_record = path.read_text()
+        except FileNotFoundError:
+            pass
+        else:
+            record = json.loads(raw_record)
+            pid = record.get("pid") if isinstance(record, dict) else None
+            if type(pid) is not int or pid <= 0:
+                raise ValueError(f"invalid PID record: {path}")
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise ValueError(f"process {pid} from {path} still exists")
+except (OSError, ValueError, OverflowError) as error:
+    print(f"Daemon state check: {error}", file=sys.stderr)
     sys.exit(1)
 PY
     then

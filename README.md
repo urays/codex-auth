@@ -19,7 +19,7 @@ Supports Linux and macOS.
 - Bash 3.2 or later (the built-in macOS Bash is supported)
 - `jq`
 - `curl`
-- Lastest [Codex CLI](https://github.com/openai/codex)
+- [Codex CLI](https://github.com/openai/codex) the latest version
 - Python 3
 
 ## Installation
