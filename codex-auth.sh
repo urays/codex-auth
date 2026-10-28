@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # codex-auth.sh — manage multiple Codex CLI accounts from a single auth pool.
 # Compatible with Bash 3.2+ on macOS and Linux (BSD/GNU utilities).
@@ -10,7 +11,7 @@ set -euo pipefail
 #   - ALL credentials live in ONE pool file: ~/.codex/auth-poll.json (JSON array)
 #   - Except for `clean`, every run FIRST auto-upserts ~/.codex/auth.json into the
 #     pool (when it exists), keyed by auth identity
-#     (chatgpt account_id / api key) — no explicit save command.
+#     (ChatGPT workspace + user / API key) — no explicit save command.
 #   - `codex-auth` (no arguments) prints the account list with live usage
 #     windows fetched from ChatGPT's usage API and cached subscription dates.
 #   - `codex-auth switch` shows the same list followed by an email-based
@@ -28,7 +29,8 @@ set -euo pipefail
 #     The current account is protected; switch accounts before removing it.
 #   - Session/history files stay in the same CODEX_HOME. Finish active work
 #     before changing accounts: restarting the daemon can interrupt calls.
-#     config.toml may be updated to enforce cli_auth_credentials_store = "file".
+#     Only login and confirmed switches may update config.toml to enforce
+#     cli_auth_credentials_store = "file". Listing never changes that setting.
 
 CODEX_AUTH_HOME="${CODEX_HOME:-$HOME/.codex}"
 CURRENT_AUTH_FILE="${CURRENT_AUTH_FILE:-$CODEX_AUTH_HOME/auth.json}"
@@ -54,20 +56,14 @@ if [[ $# -ge 1 ]]; then
   esac
 fi
 
-if [[ $# -ge 1 ]]; then
-  # An optional positional argument is a custom pool file path. Accept it only
-  # when it looks like a path; otherwise report an unknown command.
-  if [[ "$1" == *.json || "$1" == */* ]]; then
-    POOL_FILE="$1"
-    shift
-  else
-    echo "Error: unknown command: $1 (supported: login, switch, clean, or run without arguments)" >&2
-    exit 1
-  fi
+if [[ $# -ge 1 && "$1" != -* && ( "$1" == *.json || "$1" == */* ) ]]; then
+  # Keep the existing optional custom pool path.
+  POOL_FILE="$1"
+  shift
 fi
 
 if [[ $# -gt 0 ]]; then
-  echo "Error: unexpected argument: $1" >&2
+  echo "Error: unknown command or unexpected argument: $1 (supported: login, switch, clean, or a pool path)" >&2
   exit 1
 fi
 
@@ -86,6 +82,11 @@ REVERSE='\033[7m'
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "Error: jq is required but not installed." >&2
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Error: Python 3 is required but not installed." >&2
   exit 1
 fi
 
@@ -112,8 +113,56 @@ cleanup() {
   if [[ -n "${TMP_CLEAN_FILE:-}" && -f "$TMP_CLEAN_FILE" ]]; then
     rm -f "$TMP_CLEAN_FILE"
   fi
+  if [[ -n "${TMP_SNAPSHOT_FILE:-}" && -f "$TMP_SNAPSHOT_FILE" ]]; then
+    rm -f "$TMP_SNAPSHOT_FILE"
+  fi
 }
 trap cleanup EXIT
+
+# ------------- mutation locks -------------
+# flock(2) is available through Python on both macOS and Linux; no external
+# `flock` command is required. The shell keeps the locked descriptors open.
+# Never unlink lock files: another process may already be waiting on the inode.
+AUTH_LOCK_HELD=0
+POOL_LOCK_HELD=0
+
+lock_descriptor() {
+  python3 - "$1" "$2" <<'PY'
+import fcntl
+import sys
+import time
+
+deadline = time.monotonic() + 10
+while True:
+    try:
+        fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        if time.monotonic() >= deadline:
+            print(f"Error: another codex-auth operation is using {sys.argv[2]}; retry after it finishes.", file=sys.stderr)
+            sys.exit(1)
+        time.sleep(0.05)
+PY
+}
+
+with_state_locks() (
+  # A subshell scopes descriptors and cleanup to this transaction, including
+  # early returns. Do not clean up temporary files owned by the caller.
+  unset TMP_UPSERT_FILE TMP_AUTH_FILE TMP_DAEMON_ERROR TMP_CLEAN_FILE TMP_SNAPSHOT_FILE RESULTS_FILE
+  trap cleanup EXIT
+  mkdir -p -- "$CODEX_AUTH_HOME" || return 1
+  if [[ "$AUTH_LOCK_HELD" -eq 0 ]]; then
+    exec 8>>"${CURRENT_AUTH_FILE}.codex-auth.lock" || return 1
+    lock_descriptor 8 "$CURRENT_AUTH_FILE" || return 1
+    AUTH_LOCK_HELD=1
+  fi
+  if [[ "$POOL_LOCK_HELD" -eq 0 ]]; then
+    exec 9>>"${POOL_FILE}.lock" || return 1
+    lock_descriptor 9 "$POOL_FILE" || return 1
+    POOL_LOCK_HELD=1
+  fi
+  "$@"
+)
 
 # ------------- auth pool helpers -------------
 # Match AuthDotJson::resolved_mode in the current Codex CLI. auth_mode is optional.
@@ -126,6 +175,29 @@ AUTH_MODE_JQ='
       elif .OPENAI_API_KEY != null then "apikey"
       else "chatgpt" end
     );
+
+  def nonempty_string: type == "string" and length > 0;
+  def auth_identity:
+    if auth_mode == "chatgpt" then
+      .tokens as $t
+      | if ($t.account_id | nonempty_string) and ($t.id_token | nonempty_string) then
+          (try ($t.id_token | split(".")[1] | gsub("-"; "+") | gsub("_"; "/")
+                | @base64d | fromjson) catch {}) as $claims
+          | (try ([ $claims["https://api.openai.com/auth"].chatgpt_user_id,
+                    $claims["https://api.openai.com/auth"].user_id,
+                    $claims.sub ] | map(select(nonempty_string)) | .[0]) catch null) as $user
+          # Legacy tokens without a user claim stay distinct. Never merge
+          # unidentified users merely because they share a workspace.
+          | ["chatgpt", $t.account_id,
+             (if $user != null then ["user", $user] else ["token", $t.id_token] end)] | tojson
+        else "" end
+    elif auth_mode == "apikey" and (.OPENAI_API_KEY | nonempty_string) then
+      ["apikey", .OPENAI_API_KEY] | tojson
+    else "" end;
+
+  def same_account($a; $b):
+    ($a == $b) or (($a | auth_identity) as $id
+      | $id != "" and $id == ($b | auth_identity));
 '
 
 get_auth_mode() {
@@ -133,13 +205,7 @@ get_auth_mode() {
 }
 
 get_auth_identity() {
-  local raw="$1" mode
-  mode="$(get_auth_mode "$raw")"
-  case "$mode" in
-    chatgpt) jq -r '.tokens.account_id // empty' <<<"$raw" ;;
-    apikey)  jq -r '.OPENAI_API_KEY // empty' <<<"$raw" ;;
-    *)       echo "" ;;
-  esac
+  jq -r "$AUTH_MODE_JQ auth_identity" <<<"$1"
 }
 
 get_auth_label() {
@@ -211,6 +277,7 @@ import base64
 from datetime import datetime
 import json
 import os
+import re
 import sys
 
 def require(condition):
@@ -256,6 +323,10 @@ try:
                 require(isinstance(details["chatgpt_account_is_fedramp"], bool))
     refreshed = auth.get("last_refresh")
     if refreshed is not None:
+        # Python 3.7–3.10 only accepts 3 or 6 fractional digits. Normalize for
+        # validation; refresh ordering below retains the full precision.
+        refreshed = re.sub(r"(:\d{2})\.(\d+)",
+                           lambda m: m[1] + "." + m[2][:6].ljust(6, "0"), refreshed)
         require(datetime.fromisoformat(refreshed.replace("Z", "+00:00")).tzinfo is not None)
     with os.fdopen(3) as stream:
         expected = json.load(stream)
@@ -285,51 +356,116 @@ ensure_pool_file() {
     echo '[]' > "$POOL_FILE" || return 1
   fi
   chmod 600 "$POOL_FILE" || return 1
-  if ! jq -e 'type == "array"' "$POOL_FILE" > /dev/null; then
-    echo "Error: auth pool file is not a JSON array: $POOL_FILE" >&2
+  if ! jq -se 'length == 1 and (.[0] | type == "array" and all(.[]; type == "object"))' "$POOL_FILE" > /dev/null; then
+    echo "Error: auth pool file is not a JSON array of accounts: $POOL_FILE" >&2
     return 1
   fi
 }
 
 upsert_current_auth_if_present() {
+  with_state_locks upsert_current_auth_locked
+}
+
+check_pool_refresh_order() {
+  local matching decision
+  matching="$(jq -c --slurpfile current "$TMP_SNAPSHOT_FILE" "$AUTH_MODE_JQ"'
+    ($current[0] | auth_identity) as $id
+    | [.[] | select(auth_identity == $id)]
+  ' "$POOL_FILE")" || return 1
+  # A shared pool can already contain tokens refreshed in another CODEX_HOME.
+  # Compare actual instants, including offsets and fractional seconds. Reading
+  # auth.json later does not imply that its credential is newer.
+  decision="$(python3 - "$TMP_SNAPSHOT_FILE" 3<<<"$matching" <<'PY'
+from datetime import datetime
+import json
+import os
+import re
+import sys
+
+def timestamp(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        fraction = re.search(r":\d{2}\.(\d+)", value)
+        digits = fraction[1] if fraction else ""
+        normalized = re.sub(r"(:\d{2})\.(\d+)",
+                            lambda m: m[1] + "." + m[2][:6].ljust(6, "0"), value)
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        # datetime stores only microseconds. Use the original fractional digits
+        # to distinguish refreshes within the same microsecond on every Python.
+        return (parsed, digits.rstrip("0")) if parsed.tzinfo is not None else None
+    except ValueError:
+        return None
+
+with open(sys.argv[1]) as stream:
+    current = json.load(stream)
+with os.fdopen(3) as stream:
+    saved = json.load(stream)
+current_time = timestamp(current["last_refresh"])
+newer = False
+for entry in saved:
+    saved_time = timestamp(entry.get("last_refresh"))
+    if saved_time is None:
+        continue
+    if saved_time > current_time:
+        newer = True
+    elif saved_time == current_time and entry.get("tokens") != current["tokens"]:
+        print("Error: current and saved credentials conflict at the same refresh timestamp; refusing to overwrite the pool.", file=sys.stderr)
+        sys.exit(1)
+print("keep" if newer else "replace")
+PY
+  )" || return 1
+  POOL_HAS_NEWER_CREDENTIALS=0
+  if [[ "$decision" == "keep" ]]; then
+    POOL_HAS_NEWER_CREDENTIALS=1
+  fi
+}
+
+upsert_current_auth_locked() {
   # If a live credential file exists, add/refresh its entry in the pool
   # (keyed by identity). When no auth.json exists (not logged in), do
   # nothing — list/switch still work so a pooled credential can be restored.
-  [[ -f "$CURRENT_AUTH_FILE" ]] || return 0
+  ensure_pool_file || return 1
+  CURRENT_AUTH_SNAPSHOT='null'
+  if [[ -n "${TMP_SNAPSHOT_FILE:-}" ]]; then
+    rm -f -- "$TMP_SNAPSHOT_FILE" || return 1
+    unset TMP_SNAPSHOT_FILE
+  fi
+  [[ -e "$CURRENT_AUTH_FILE" || -L "$CURRENT_AUTH_FILE" ]] || return 0
+  CURRENT_AUTH_SNAPSHOT="$(cat "$CURRENT_AUTH_FILE")" || return 1
+  TMP_SNAPSHOT_FILE="$(mktemp "${POOL_FILE}.current.XXXXXX")" || return 1
+  printf '%s\n' "$CURRENT_AUTH_SNAPSHOT" > "$TMP_SNAPSHOT_FILE" || return 1
 
   # Only chatgpt and apikey modes are pooled. Other modes (PAT, headers,
   # agentIdentity, bedrockApiKey, ...) are warned about and skipped: they
   # never reach the pool, so login refuses to delete them.
   local live_mode
-  live_mode="$(get_auth_mode "$(cat "$CURRENT_AUTH_FILE")")" || return 1
+  live_mode="$(get_auth_mode "$CURRENT_AUTH_SNAPSHOT")" || return 1
   if [[ "$live_mode" != "chatgpt" && "$live_mode" != "apikey" ]]; then
     printf "${YELLOW}[auth] unsupported auth_mode '%s' — skipped pool upsert${RESET}\n" "$live_mode"
     return 0
   fi
 
-  validate_current_auth_file || return 1
-  ensure_pool_file || return 1
+  validate_current_auth_file "$TMP_SNAPSHOT_FILE" || return 1
+  if [[ "$live_mode" == "chatgpt" ]]; then
+    check_pool_refresh_order || return 1
+    if [[ "$POOL_HAS_NEWER_CREDENTIALS" -eq 1 ]]; then
+      printf '%b[auth] kept a newer saved credential; the current file was not copied over it.%b\n' "$DIM" "$RESET" >&2
+      return 0
+    fi
+  fi
 
   TMP_UPSERT_FILE="$(mktemp "${POOL_FILE}.XXXXXX")" || return 1
 
-  jq --slurpfile new_auth "$CURRENT_AUTH_FILE" "$AUTH_MODE_JQ"'
-    def auth_identity($a):
-      if ($a | auth_mode) == "chatgpt" then
-        ($a.tokens.account_id // "")
-      elif ($a | auth_mode) == "apikey" then
-        ($a.OPENAI_API_KEY // "")
-      else
-        ""
-      end;
-
+  jq --slurpfile new_auth "$TMP_SNAPSHOT_FILE" "$AUTH_MODE_JQ"'
     . as $pool
     | $new_auth[0] as $new
-    | auth_identity($new) as $new_id
+    | ($new | auth_identity) as $new_id
     | if ($new_id | length) == 0 then
         .
-      elif any($pool[]?; auth_identity(.) == $new_id) then
+      elif any($pool[]?; auth_identity == $new_id) then
         map(
-          if auth_identity(.) == $new_id
+          if auth_identity == $new_id
           then $new
           else .
           end
@@ -347,6 +483,10 @@ upsert_current_auth_if_present() {
 # Clean only the saved credential selected in the picker. Read the pool again
 # so unrelated additions survive, and refuse if that credential has changed.
 remove_saved_auth() {
+  with_state_locks remove_saved_auth_locked "$@"
+}
+
+remove_saved_auth_locked() {
   local raw="$1" current target_mode target_identity current_mode current_identity
   TMP_CLEAN_FILE="$(mktemp "${POOL_FILE}.XXXXXX")" || return 1
   if ! jq -s --argjson target "$raw" '
@@ -385,7 +525,8 @@ remove_saved_auth() {
 
 # ------------- account changes + managed daemon -------------
 codex_cli() {
-  CODEX_HOME="$CODEX_AUTH_HOME" command codex "$@"
+  # A newly started daemon must not inherit our transaction locks.
+  CODEX_HOME="$CODEX_AUTH_HOME" command codex "$@" 8>&- 9>&-
 }
 
 prepare_account_change() {
@@ -550,26 +691,63 @@ finish_account_change() {
 }
 
 activate_auth() {
-  local raw="$1"
+  with_state_locks activate_auth_locked "$@"
+}
+
+current_auth_matches_snapshot() {
+  if [[ "$CURRENT_AUTH_SNAPSHOT" == "null" ]]; then
+    [[ ! -e "$CURRENT_AUTH_FILE" && ! -L "$CURRENT_AUTH_FILE" ]] && return 0
+  elif [[ -f "$CURRENT_AUTH_FILE" ]] &&
+    jq -se --argjson expected "$CURRENT_AUTH_SNAPSHOT" \
+      'length == 1 and .[0] == $expected' "$CURRENT_AUTH_FILE" >/dev/null; then
+    return 0
+  fi
+  echo "Error: auth.json changed during account selection; finish other Codex activity and retry." >&2
+  return 1
+}
+
+activate_auth_locked() {
+  local raw="$1" selected
   prepare_account_change || return 1
+  # Back up one consistent snapshot, then check the selected pool entry again.
+  # This also detects a target refreshed or removed while the picker was open.
+  upsert_current_auth_locked || return 1
+  if [[ "$CURRENT_AUTH_SNAPSHOT" != "null" ]]; then
+    validate_current_auth_file "$TMP_SNAPSHOT_FILE" || return 1
+  fi
+  if ! selected="$(jq -ce --argjson expected "$raw" "$AUTH_MODE_JQ"'
+    ($expected | auth_identity) as $id
+    | if $id == "" then error("selected account has no usable identity")
+      else map(select(auth_identity == $id)) end
+    | if length == 1 and .[0] == $expected then .[0]
+      else error("selected credential changed or was removed; run switch again") end
+  ' "$POOL_FILE")"; then
+    return 1
+  fi
   TMP_AUTH_FILE="$(mktemp "$CODEX_AUTH_HOME/.auth.json.XXXXXX")" || return 1
-  if ! jq '.' <<<"$raw" > "$TMP_AUTH_FILE" ||
+  if ! jq '.' <<<"$selected" > "$TMP_AUTH_FILE" ||
      ! validate_current_auth_file "$TMP_AUTH_FILE" ||
      ! chmod 600 "$TMP_AUTH_FILE"; then
     return 1
   fi
-  # Capture tokens refreshed while the account picker was open.
-  # Unlike listing, replacing a credential requires that the pool can back it up.
-  if [[ -f "$CURRENT_AUTH_FILE" ]]; then
-    validate_current_auth_file || return 1
+  current_auth_matches_snapshot || return 1
+  ensure_file_store_config || return 1
+  # Other Codex clients do not take our lock. Detect their refreshes before
+  # replacing auth.json; callers still need to finish active Codex work first.
+  current_auth_matches_snapshot || return 1
+  if jq -e --argjson current "$CURRENT_AUTH_SNAPSHOT" '. == $current' \
+    >/dev/null <<<"$selected"; then
+    if [[ "$FILE_STORE_CONFIG_CHANGED" -eq 1 ]]; then
+      finish_account_change "$selected" || return 1
+    fi
+    return 0
   fi
-  upsert_current_auth_if_present || return 1
   if ! mv -f -- "$TMP_AUTH_FILE" "$CURRENT_AUTH_FILE"; then
     echo "Error: could not replace auth.json; daemon was not restarted." >&2
     return 1
   fi
   unset TMP_AUTH_FILE
-  finish_account_change "$raw"
+  finish_account_change "$selected"
 }
 
 # ------------- formatting helpers -------------
@@ -609,12 +787,15 @@ format_rfc3339_time() {
   fi
   if ! formatted="$(python3 - "$timestamp" 2>/dev/null <<'PYEOF'
 import datetime
+import re
 import sys
 
 timestamp = sys.argv[1]
 if timestamp.endswith("Z"):
     timestamp = timestamp[:-1] + "+00:00"
 
+timestamp = re.sub(r"(:\d{2})\.(\d+)",
+                   lambda m: m[1] + "." + m[2][:6].ljust(6, "0"), timestamp)
 parsed = datetime.datetime.fromisoformat(timestamp)
 if parsed.tzinfo is None:
     # RFC3339 normally carries an offset. Treat an offset-less value as UTC so
@@ -738,7 +919,7 @@ fetch_usage_for_account() {
   local raw_account="$1" token_email="$2"
   local auth_mode identity display_name is_current
   local access_token account_id email plan_type limit_reached
-  local response_body http_code tmp_body
+  local response_body http_code tmp_body curl_status=0 query_error
   local reset_count reset_details reset_response reset_response_body reset_http_code
 
   auth_mode="$(get_auth_mode "$raw_account")"
@@ -807,6 +988,8 @@ fetch_usage_for_account() {
   tmp_body="$(mktemp)"
   http_code="$(
     curl -sS \
+      --connect-timeout 3 \
+      --max-time 10 \
       -o "$tmp_body" \
       -w '%{http_code}' \
       "$USAGE_URL" \
@@ -829,13 +1012,19 @@ fetch_usage_for_account() {
       -H 'sec-fetch-mode: cors' \
       -H 'sec-fetch-site: same-origin' \
       -H 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36' \
-      -H 'x-openai-target-path: /backend-api/wham/usage' \
-      || echo "000"
-  )"
+      -H 'x-openai-target-path: /backend-api/wham/usage'
+  )" || curl_status=$?
   response_body="$(cat "$tmp_body" 2>/dev/null || true)"
   rm -f "$tmp_body"
 
-  if [[ "$http_code" != "200" ]]; then
+  if [[ "$curl_status" -ne 0 || "$http_code" != "200" ]]; then
+    if [[ "$curl_status" -eq 28 ]]; then
+      query_error="usage request timed out"
+    elif [[ "$curl_status" -ne 0 ]]; then
+      query_error="usage request failed (curl exit $curl_status)"
+    else
+      query_error="$(http_error_text "$http_code")"
+    fi
     local fallback_email
     fallback_email="${token_email:-$account_id}"
     jq -n \
@@ -844,7 +1033,7 @@ fetch_usage_for_account() {
       --arg identity "$identity" \
       --arg is_current "$is_current" \
       --arg email "$fallback_email" \
-      --arg query_error "$(http_error_text "$http_code")" \
+      --arg query_error "$query_error" \
       --arg raw_auth "$(jq -c . <<<"$raw_account")" \
       '{
         auth_mode: $auth_mode,
@@ -1034,7 +1223,11 @@ fetch_usage_for_account() {
         win($usage.rate_limit.secondary_window;
             label_for($usage.rate_limit.secondary_window.limit_window_seconds; true)),
         ($usage.additional_rate_limits[]? // empty
-          | win(.rate_limit.primary_window; .limit_name)) ];
+          | (.limit_name // "additional") as $name
+          | win(.rate_limit.primary_window;
+                $name + " (" + label_for(.rate_limit.primary_window.limit_window_seconds; false) + ")"),
+            win(.rate_limit.secondary_window;
+                $name + " (" + label_for(.rate_limit.secondary_window.limit_window_seconds; true) + ")")) ];
 
     ($usage.credits.has_credits // false) as $hc
     | {
@@ -1096,15 +1289,6 @@ build_clean_results() {
     mode="$(get_auth_mode "$account")" || return 1
     jq -n --argjson raw "$account" --argjson metadata "$metadata" \
       --argjson current "$current" --arg display_label "$label" --arg mode "$mode" "$AUTH_MODE_JQ"'
-      def same_account($a; $b):
-        ($a == $b) or (
-          ($a | auth_mode) == ($b | auth_mode) and
-          (if ($a | auth_mode) == "chatgpt" then
-             ($a.tokens.account_id // "") != "" and $a.tokens.account_id == $b.tokens.account_id
-           elif ($a | auth_mode) == "apikey" then
-             ($a.OPENAI_API_KEY // "") != "" and $a.OPENAI_API_KEY == $b.OPENAI_API_KEY
-           else false end)
-        );
       {
         email: (if ($metadata.email // "") != "" then
                   $metadata.email + " [" + $display_label + "]"
@@ -1261,7 +1445,7 @@ render_picker_lines() {
 }
 
 run_merged() {
-  local sorted_json count selected key item target_label is_current
+  local sorted_json count selected key item target_label
   local previous
 
   sorted_json="$(sort_results_to_json)"
@@ -1309,20 +1493,11 @@ run_merged() {
 
     if [[ "$key" == "" ]]; then
       item="$(jq -c ".[$selected]" <<<"$sorted_json")"
-      is_current="$(jq -r '.is_current' <<<"$item")"
       target_label="$(jq -r '.email' <<<"$item")"
 
       if [[ "$MODE" == "clean" ]]; then
         remove_saved_auth "$(jq '.raw_auth' <<<"$item")" || return 1
         printf "\nRemoved saved account: %s\n" "$target_label"
-        return 0
-      fi
-
-      if [[ "$is_current" == "true" ]]; then
-        # Enter on the active account: nothing changes; show the outcome in
-        # the same dim style as the cancel message.
-        printf "\033[H\033[J"
-        printf "${DIM}Current account: %s${RESET}\n" "$target_label"
         return 0
       fi
 
@@ -1356,6 +1531,8 @@ run_merged() {
 
 # ------------- config.toml guard -------------
 ensure_file_store_config() {
+  local config_result
+  FILE_STORE_CONFIG_CHANGED=0
   # The current Codex default is file storage; an absent config needs no edit.
   if [[ ! -f "$CONFIG_TOML" ]]; then
     if [[ -e "$CONFIG_TOML" || -L "$CONFIG_TOML" ]]; then
@@ -1364,7 +1541,18 @@ ensure_file_store_config() {
     fi
     return 0
   fi
-  if ! python3 - "$CONFIG_TOML" <<'PY'
+  if ! config_result="$(write_file_store_config)"; then
+    return 1
+  fi
+  if [[ "$config_result" == "changed" ]]; then
+    FILE_STORE_CONFIG_CHANGED=1
+    printf '%b[config] cli_auth_credentials_store = "file"%b\n' "$DIM" "$RESET"
+  fi
+}
+
+write_file_store_config() {
+  # Bash 3.2 misparses this heredoc when it is nested directly in $(...).
+  python3 - "$CONFIG_TOML" <<'PY'
 import os
 from pathlib import Path
 import re
@@ -1435,6 +1623,7 @@ try:
             stream.write(updated)
         os.replace(temporary, path)
         temporary = None
+        print("changed")
 except (OSError, ValueError) as error:
     print(f"Error: could not configure file credential storage: {error}", file=sys.stderr)
     sys.exit(1)
@@ -1442,10 +1631,6 @@ finally:
     if temporary is not None:
         os.unlink(temporary)
 PY
-  then
-    return 1
-  fi
-  printf '%b[config] cli_auth_credentials_store = "file"%b\n' "$DIM" "$RESET"
 }
 
 check_current_auth_presence() {
@@ -1453,12 +1638,16 @@ check_current_auth_presence() {
   # the credential file is missing (e.g. it lived in an OS keyring before the
   # store mode was switched to file) does codex need to authenticate again.
   if [[ ! -f "$CURRENT_AUTH_FILE" ]]; then
-    printf "${YELLOW}[auth] no credential file at %s — run: ${BOLD}codex login${RESET}\n" "$CURRENT_AUTH_FILE"
+    printf "${YELLOW}[auth] no credential file at %s — run: ${BOLD}codex-auth login${RESET}\n" "$CURRENT_AUTH_FILE"
   fi
 }
 
 # ------------- login flow -------------
 cmd_login() {
+  with_state_locks cmd_login_locked "$@"
+}
+
+cmd_login_locked() {
   # Guide a NEW account login: back up the live credential into the pool,
   # remove auth.json so the device-auth flow starts fresh, run the real
   # `codex login`, then capture the result back into the pool. A live
@@ -1466,22 +1655,26 @@ cmd_login() {
   local expected_auth
   prepare_account_change || return 1
 
-  ensure_file_store_config
   check_current_auth_presence
-  upsert_current_auth_if_present
+  upsert_current_auth_locked || return 1
 
-  if [[ -f "$CURRENT_AUTH_FILE" ]]; then
+  if [[ "$CURRENT_AUTH_SNAPSHOT" != "null" ]]; then
     # The pool holds only chatgpt and apikey credentials, and the upsert
     # above skipped every other mode. Deleting such a file would destroy
     # the only copy of a credential nothing can restore, so refuse instead.
     local live_mode
-    live_mode="$(get_auth_mode "$(cat "$CURRENT_AUTH_FILE")")"
+    live_mode="$(get_auth_mode "$CURRENT_AUTH_SNAPSHOT")" || return 1
     if [[ "$live_mode" != "chatgpt" && "$live_mode" != "apikey" ]]; then
       printf "${RED}Error: current auth.json uses unsupported auth_mode '%s', which the pool cannot store.${RESET}\n" "$live_mode" >&2
       printf "${RED}Refusing to delete the only credential copy; back it up or move it away manually, then re-run login.${RESET}\n" >&2
       exit 1
     fi
-    rm -f "$CURRENT_AUTH_FILE"
+  fi
+  current_auth_matches_snapshot || return 1
+  ensure_file_store_config || return 1
+  current_auth_matches_snapshot || return 1
+  if [[ "$CURRENT_AUTH_SNAPSHOT" != "null" ]]; then
+    rm -f "$CURRENT_AUTH_FILE" || return 1
     printf "${GREEN}[login] previous credential is safe in the pool; auth.json cleared.${RESET}\n"
   fi
   printf "${DIM}Finish active Codex/Lumen work first; successful login restarts a running daemon.${RESET}\n"
@@ -1500,7 +1693,7 @@ cmd_login() {
   validate_current_auth_file || return 1
   chmod 600 "$CURRENT_AUTH_FILE" || return 1
   expected_auth="$(cat "$CURRENT_AUTH_FILE")" || return 1
-  upsert_current_auth_if_present || return 1
+  upsert_current_auth_locked || return 1
   finish_account_change "$expected_auth" || return 1
   printf "\n${GREEN}[login] new account captured into the pool.${RESET}\n"
   codex_cli login status || true
@@ -1531,7 +1724,6 @@ if [[ "$MODE" == "login" ]]; then
 fi
 
 printf "${DIM}> %s${RESET}\n" "$(format_abs_time "$(date +%s)")"
-ensure_file_store_config
 check_current_auth_presence
 upsert_current_auth_if_present
 
@@ -1541,7 +1733,6 @@ else
   CURRENT_AUTH_IDENTITY=""
 fi
 
-ensure_pool_file
 build_results
 
 run_merged

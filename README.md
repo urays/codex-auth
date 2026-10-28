@@ -20,7 +20,7 @@ Supports Linux and macOS.
 - `jq`
 - `curl`
 - [Codex CLI](https://github.com/openai/codex) the latest version
-- Python 3
+- Python 3.7 or later
 
 ## Installation
 
