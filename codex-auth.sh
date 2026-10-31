@@ -524,10 +524,12 @@ remove_saved_auth_locked() {
 }
 
 # ------------- account changes + managed daemon -------------
-codex_cli() {
-  # A newly started daemon must not inherit our transaction locks.
-  CODEX_HOME="$CODEX_AUTH_HOME" command codex "$@" 8>&- 9>&-
-}
+codex_cli() (
+  # Close locks permanently in this subshell. Bash 3.2 can otherwise pass
+  # saved copies of temporarily redirected descriptors to a new daemon.
+  exec 8>&- 9>&-
+  CODEX_HOME="$CODEX_AUTH_HOME" exec codex "$@"
+)
 
 prepare_account_change() {
   local auth_dir config_dir
